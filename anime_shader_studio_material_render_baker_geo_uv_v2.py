@@ -12,6 +12,10 @@ import bpy
 import os
 import tempfile
 import shutil
+import zipfile
+import urllib.request
+import urllib.error
+import ssl
 
 try:
     import numpy as np
@@ -28,11 +32,179 @@ DEFAULT_SIZE = 1024
 MASK_COLORSPACE = "Non-Color"
 PACKED_ALPHA_MODE = "CHANNEL_PACKED"
 
+PATTERN_PRESET_KEYS = ("PANTYHOSE", "STRIPES", "RIPPED", "BODYSUIT_HEX", "DOTS", "COTTON", "LEATHER")
+
 def get_mat_name(base_name):
     return f"{base_name}_AnimeToon"
 
 def ensure_dir(path: str):
     if path: os.makedirs(path, exist_ok=True)
+
+def pattern_cache_root(scene=None):
+    custom_dir = None
+    try:
+        custom_dir = getattr(scene or bpy.context.scene, "genos_pattern_cache_dir", "")
+    except Exception:
+        custom_dir = ""
+    if custom_dir:
+        try:
+            root = bpy.path.abspath(custom_dir)
+            ensure_dir(root)
+            return root
+        except Exception:
+            pass
+    root = bpy.utils.user_resource('SCRIPTS', path=os.path.join("addons_data", "anime_shader_studio", "patterns"), create=True)
+    ensure_dir(root)
+    return root
+
+def pattern_preset_url(scene, key):
+    key_map = {
+        "PANTYHOSE": getattr(scene, "genos_pattern_url_pantyhose", ""),
+        "STRIPES": getattr(scene, "genos_pattern_url_stripes", ""),
+        "RIPPED": getattr(scene, "genos_pattern_url_ripped", ""),
+        "BODYSUIT_HEX": getattr(scene, "genos_pattern_url_bodysuit", ""),
+        "DOTS": getattr(scene, "genos_pattern_url_dots", ""),
+        "COTTON": getattr(scene, "genos_pattern_url_cotton", ""),
+        "LEATHER": getattr(scene, "genos_pattern_url_leather", ""),
+    }
+    return key_map.get(key, "")
+
+def find_first_file(path, include_tokens):
+    if not os.path.isdir(path):
+        return None
+    include_tokens = [t.lower() for t in include_tokens]
+    for root, _, files in os.walk(path):
+        for fname in files:
+            low = fname.lower()
+            if any(tok in low for tok in include_tokens):
+                return os.path.join(root, fname)
+    return None
+
+def copy_if_exists(src, dst):
+    if not src or not os.path.exists(src):
+        return None
+    shutil.copy2(src, dst)
+    return dst
+
+def copy_with_src_ext(src, dst_no_ext):
+    if not src or not os.path.exists(src):
+        return None
+    ext = os.path.splitext(src)[1] or ".png"
+    dst = dst_no_ext + ext
+    shutil.copy2(src, dst)
+    return dst
+
+def _download_file(url, dst_path):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    })
+
+    last_err = None
+    contexts = [None]
+    try:
+        contexts.append(ssl._create_unverified_context())
+    except Exception:
+        pass
+
+    for ctx in contexts:
+        try:
+            with urllib.request.urlopen(req, timeout=60, context=ctx) as response:
+                with open(dst_path, 'wb') as f:
+                    shutil.copyfileobj(response, f)
+            if os.path.exists(dst_path) and os.path.getsize(dst_path) > 0:
+                return
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Download failed for {url}: {last_err}")
+
+def download_pattern_preset(scene, key):
+    url = pattern_preset_url(scene, key)
+    if not url:
+        raise RuntimeError(f"No URL configured for preset: {key}")
+
+    root = pattern_cache_root(scene)
+    preset_dir = os.path.join(root, key.lower())
+    ensure_dir(preset_dir)
+
+    zip_path = os.path.join(preset_dir, "source.zip")
+    _download_file(url, zip_path)
+
+    if not zipfile.is_zipfile(zip_path):
+        head = b""
+        try:
+            with open(zip_path, 'rb') as f:
+                head = f.read(180)
+        except Exception:
+            pass
+        head_txt = ""
+        try:
+            head_txt = head.decode('utf-8', errors='ignore').strip().replace('\n', ' ')[:120]
+        except Exception:
+            pass
+        raise RuntimeError(f"Downloaded file is not a ZIP. URL may be blocked or redirected. Header preview: {head_txt}")
+
+    extract_dir = os.path.join(preset_dir, "extracted")
+    if os.path.isdir(extract_dir):
+        shutil.rmtree(extract_dir, ignore_errors=True)
+    ensure_dir(extract_dir)
+
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        zf.extractall(extract_dir)
+
+    color_src = find_first_file(extract_dir, ["_color.", "color.", "albedo", "basecolor"])
+    rough_src = find_first_file(extract_dir, ["_roughness.", "roughness."])
+    normal_src = find_first_file(extract_dir, ["_normalgl.", "_normal.", "normal."])
+
+    color_dst = copy_with_src_ext(color_src, os.path.join(preset_dir, "color"))
+    rough_dst = copy_with_src_ext(rough_src, os.path.join(preset_dir, "roughness"))
+    normal_dst = copy_with_src_ext(normal_src, os.path.join(preset_dir, "normal"))
+
+    if not color_dst:
+        raise RuntimeError("Texture pack downloaded, but no color/albedo/basecolor map was found inside ZIP.")
+
+    return {
+        "dir": preset_dir,
+        "zip": zip_path,
+        "color": color_dst,
+        "roughness": rough_dst,
+        "normal": normal_dst,
+    }
+
+def cached_pattern_paths(scene, key):
+    preset_dir = os.path.join(pattern_cache_root(scene), key.lower())
+    color = find_first_file(preset_dir, ["color.", "_color.", "albedo", "basecolor"])
+    rough = find_first_file(preset_dir, ["roughness.", "_roughness."])
+    normal = find_first_file(preset_dir, ["normal.", "_normal.", "_normalgl."])
+    out = {
+        "dir": preset_dir,
+        "color": color,
+        "roughness": rough,
+        "normal": normal,
+    }
+    return out
+
+def load_or_reload_image(path, *, non_color=False):
+    if not path or not os.path.exists(path):
+        return None
+    abspath = os.path.abspath(path)
+    for img in bpy.data.images:
+        try:
+            if bpy.path.abspath(img.filepath) == abspath or bpy.path.abspath(img.filepath_raw) == abspath:
+                try:
+                    img.reload()
+                except Exception:
+                    pass
+                set_image_colorspace(img, 'Non-Color' if non_color else 'sRGB')
+                return img
+        except Exception:
+            pass
+    try:
+        img = bpy.data.images.load(abspath)
+        set_image_colorspace(img, 'Non-Color' if non_color else 'sRGB')
+        return img
+    except Exception:
+        return None
 
 def load_image_if_exists(filepath, non_color=False):
     if not filepath: return None
@@ -51,7 +223,7 @@ def load_image_if_exists(filepath, non_color=False):
     except Exception:
         return None
 
-def try_load_packed_maps_into_images(mat, images):
+def try_load_packed_maps_into_images(mat, images, only_missing=True):
     # Prefer packed ILM/Detail images if they exist on disk or on the material
     scene = getattr(bpy.context, 'scene', None)
     out_dir = None
@@ -102,7 +274,8 @@ def try_load_packed_maps_into_images(mat, images):
         try: mat.genos_ilm_packed = ilm_img
         except Exception: pass
         for k in ("ilm_shadow", "ilm_emission", "ilm_spec", "ilm_rim"):
-            images[k] = ilm_img
+            if not only_missing or not images.get(k):
+                images[k] = ilm_img
 
     detail_candidates = {
         'prop': 'genos_detail_packed',
@@ -114,7 +287,8 @@ def try_load_packed_maps_into_images(mat, images):
         try: mat.genos_detail_packed = det_img
         except Exception: pass
         for k in ("detail_ao", "detail_curve", "detail_accent", "detail_emission"):
-            images[k] = det_img
+            if not only_missing or not images.get(k):
+                images[k] = det_img
     # SDF map candidates (face shader)
     sdf_candidates = {
         'prop': 'genos_sdf_map',
@@ -122,7 +296,7 @@ def try_load_packed_maps_into_images(mat, images):
         'names': [f"{base}_SDF", f"{base}{getattr(scene, 'genos_exp_suf_sdf', '_SDF')}.png"]
     }
     sdf_img = find_packed(sdf_candidates, non_color=True)
-    if sdf_img:
+    if sdf_img and (not only_missing or not images.get("sdf_map")):
         images["sdf_map"] = sdf_img
 
 def set_image_colorspace(img, colorspace):
@@ -134,6 +308,31 @@ def set_channel_packed_alpha(img):
     if img is None: return
     try: img.alpha_mode = PACKED_ALPHA_MODE
     except Exception: pass
+
+def ensure_image_data(img, fallback_color=None, width=DEFAULT_SIZE, height=DEFAULT_SIZE):
+    if img is None:
+        return None
+    try:
+        if getattr(img, 'has_data', False) and img.size[0] > 0 and img.size[1] > 0:
+            return img
+    except Exception:
+        pass
+
+    # Preserve external/file-backed textures by reloading them instead of replacing with generated black data.
+    try:
+        if getattr(img, 'source', '') == 'FILE' or bpy.path.abspath(getattr(img, 'filepath', '') or getattr(img, 'filepath_raw', '')):
+            try:
+                img.reload()
+            except Exception:
+                pass
+            if getattr(img, 'has_data', False) and img.size[0] > 0 and img.size[1] > 0:
+                return img
+    except Exception:
+        pass
+
+    if fallback_color is not None:
+        fill_image_solid(img, fallback_color, width, height)
+    return img
 
 def configure_mask_image(img, *, packed=False):
     set_image_colorspace(img, MASK_COLORSPACE)
@@ -174,8 +373,8 @@ def make_image(name, width, height, *, alpha=True, colorspace="sRGB", color=(0.5
     if img is None:
         img = bpy.data.images.new(name=name, width=width, height=height, alpha=alpha, float_buffer=False)
         fill_image_solid(img, color, width, height)
-    elif not getattr(img, 'has_data', False) or img.size[0] == 0:
-        fill_image_solid(img, color, width, height)
+    else:
+        ensure_image_data(img, color, width, height)
         
     set_image_colorspace(img, colorspace)
     return img
@@ -435,7 +634,8 @@ def set_active_image_node(mat, target_key):
         "DETAIL_AO": "Detail_AO",
         "DETAIL_CURVE": "Detail_Curve",
         "DETAIL_ACCENT": "Detail_Accent",
-        "DETAIL_EMISSION": "Detail_Emission"
+        "DETAIL_EMISSION": "Detail_Emission",
+        "PATTERN_MASK": "Pattern Mask"
     }
     name = node_map.get(target_key)
     if name and mat and mat.use_nodes:
@@ -721,6 +921,8 @@ def source_node_image(mat, node_name):
 
 def ensure_source_image(mat, node_name, suffix, color, colorspace=MASK_COLORSPACE):
     img = source_node_image(mat, node_name)
+    if img is not None:
+        ensure_image_data(img, None, scene_texture_size(), scene_texture_size())
     if img is None or not getattr(img, 'has_data', False) or img.size[0] == 0:
         img = make_image(f"{material_base_name(mat)}_{suffix}", scene_texture_size(), scene_texture_size(), alpha=True, colorspace=colorspace, color=color)
     set_image_colorspace(img, colorspace)
@@ -1476,14 +1678,18 @@ def bake_preview_texture(context, mat, *, emission_only=False):
 def build_preview_material(mat, images):
     mat.use_nodes = True
     mat["is_anime_toon"] = True 
-    # Read shader type (DEFAULT, FACE, HAIR)
     shader_type = mat.get("genos_shader_type", "DEFAULT")
 
     try:
-        mat.blend_method = 'CLIP'
-        mat.shadow_method = 'CLIP' 
-        mat.alpha_threshold = 0.5
-        mat.show_transparent_back = False 
+        if shader_type == 'HAIR':
+            mat.blend_method = 'HASHED'
+            mat.shadow_method = 'CLIP'
+            mat.show_transparent_back = False
+        else:
+            mat.blend_method = 'CLIP'
+            mat.shadow_method = 'CLIP' 
+            mat.alpha_threshold = 0.5
+            mat.show_transparent_back = False 
     except AttributeError: pass
 
     nodes = mat.node_tree.nodes
@@ -1510,6 +1716,22 @@ def build_preview_material(mat, images):
     safe_curve = get_safe("detail_curve", "Detail_CurveSrc", (0.0, 0.0, 0.0, 1.0), MASK_COLORSPACE, True)
     safe_accent = get_safe("detail_accent", "Detail_AccentSrc", (0.0, 0.0, 0.0, 1.0), MASK_COLORSPACE, True)
     safe_det_emit = get_safe("detail_emission", "Detail_EmissionSrc", (0.0, 0.0, 0.0, 1.0), MASK_COLORSPACE, True)
+    safe_pattern_mask = get_safe("pattern_mask", "PatternMask", (0.0, 0.0, 0.0, 1.0), MASK_COLORSPACE, True)
+    
+    # Retrieve from images dict first to handle garbage collection survivability during nodes.clear()
+    safe_pattern_color = images.get("pattern_color")
+    if safe_pattern_color is None: safe_pattern_color = getattr(mat, "genos_pattern_color_map", None)
+    if safe_pattern_color: set_image_colorspace(safe_pattern_color, "sRGB")
+    
+    safe_pattern_roughness = images.get("pattern_roughness")
+    if safe_pattern_roughness is None: safe_pattern_roughness = getattr(mat, "genos_pattern_roughness_map", None)
+    if safe_pattern_roughness: set_image_colorspace(safe_pattern_roughness, "Non-Color")
+    
+    safe_pattern_normal = images.get("pattern_normal")
+    if safe_pattern_normal is None: safe_pattern_normal = getattr(mat, "genos_pattern_normal_map", None)
+    if safe_pattern_normal: set_image_colorspace(safe_pattern_normal, "Non-Color")
+    
+    safe_disp = get_safe("displacement_map", "Displacement", (0.5, 0.5, 0.5, 1.0), "Non-Color", False)
 
     output = make_node(nodes, "ShaderNodeOutputMaterial", "Material Output", (3000, 0))
     mix_shader = make_node(nodes, "ShaderNodeMixShader", "Alpha Blend", (2700, 0))
@@ -1522,7 +1744,7 @@ def build_preview_material(mat, images):
     link(links, strength_val.outputs[0], emission_out.inputs["Strength"])
     link(links, transparent_bsdf.outputs[0], mix_shader.inputs[1]) 
     link(links, emission_out.outputs[0], mix_shader.inputs[2])     
-    link(links, mix_shader.outputs[0], output.inputs[0])
+    link(links, mix_shader.outputs[0], output.inputs["Surface"])
 
     base_tex = make_node(nodes, "ShaderNodeTexImage", "BaseColor", (-1500, 400))
     base_tex.image = safe_basecolor
@@ -1532,7 +1754,34 @@ def build_preview_material(mat, images):
     alpha_clip_gate.operation = 'GREATER_THAN'
     alpha_clip_gate.inputs[1].default_value = 0.1
     link(links, base_tex.outputs[1], alpha_clip_gate.inputs[0])
-    link(links, alpha_clip_gate.outputs[0], mix_shader.inputs[0])
+
+    if shader_type == 'HAIR':
+        hair_transparency_val = make_node(nodes, "ShaderNodeValue", "Hair Transparency", (2500, 100))
+        hair_transparency_val.outputs[0].default_value = getattr(bpy.context.scene, "genos_hair_transparency", 0.5)
+
+        # Depth-based alpha masking for eye transparency (Hair over Eyes effect)
+        light_path = make_node(nodes, "ShaderNodeLightPath", "Light Path", (2300, 400))
+        transparent_depth = make_node(nodes, "ShaderNodeMath", "Is Transparent Depth", (2450, 400))
+        transparent_depth.operation = 'GREATER_THAN'
+        link(links, light_path.outputs["Transparent Depth"], transparent_depth.inputs[0])
+        transparent_depth.inputs[1].default_value = 0.0
+        
+        # Mix base alpha config with the transparency blend whenever depth check hits
+        depth_mix = make_node(nodes, "ShaderNodeMix", "Depth Mix Alpha", (2600, 300))
+        depth_mix.data_type = 'FLOAT'
+        depth_mix.blend_type = 'MIX'
+        link(links, transparent_depth.outputs[0], depth_mix.inputs["Factor"])
+        link(links, hair_transparency_val.outputs[0], depth_mix.inputs["B"])
+        depth_mix.inputs["A"].default_value = 1.0 # 1.0 alpha normal case
+
+        # Multiplied overall hair alpha factor
+        hair_alpha_factor = make_node(nodes, "ShaderNodeMath", "Hair Alpha Factor", (2700, 150))
+        hair_alpha_factor.operation = 'MULTIPLY'
+        link(links, alpha_clip_gate.outputs[0], hair_alpha_factor.inputs[0])
+        link(links, depth_mix.outputs["Result"], hair_alpha_factor.inputs[1])
+        link(links, hair_alpha_factor.outputs[0], mix_shader.inputs[0])
+    else:
+        link(links, alpha_clip_gate.outputs[0], mix_shader.inputs[0])
 
     emission_map = make_node(nodes, "ShaderNodeTexImage", "Emission Map", (-1500, 300))
     emission_map.image = safe_emission
@@ -1589,16 +1838,41 @@ def build_preview_material(mat, images):
     det_emit.image = safe_det_emit
     det_emit.interpolation = 'Linear'
 
-    # Normal Map Support
-    normal_map_node = make_node(nodes, "ShaderNodeNormalMap", "Normal Map", (-1500, -800))
+    pattern_mask = make_node(nodes, "ShaderNodeTexImage", "Pattern Mask", (-1500, -780))
+    pattern_mask.image = safe_pattern_mask
+    pattern_mask.interpolation = 'Linear'
+
+    disp_map = make_node(nodes, "ShaderNodeTexImage", "Displacement Map", (-1500, -700))
+    disp_map.image = safe_disp
+    disp_map.interpolation = 'Linear'
+    try: disp_map.image.colorspace_settings.name = 'Non-Color'
+    except: pass
+
+    normal_map_node = make_node(nodes, "ShaderNodeNormalMap", "Normal Map", (-1500, -900))
+    # EEVEE normal details tuning:
+    try: normal_map_node.inputs["Strength"].default_value = 1.0
+    except: pass
+
+    bump_node = make_node(nodes, "ShaderNodeBump", "Displacement Bump", (-1300, -900))
+    bump_node.inputs["Distance"].default_value = getattr(scene, "genos_displacement_strength", 0.1)
+    try: bump_node.inputs["Invert"].default_value = 0
+    except: pass
+    link(links, disp_map.outputs[0], bump_node.inputs["Height"])
+    link(links, normal_map_node.outputs["Normal"], bump_node.inputs["Normal"])
+    
+    # Pre-declare our normal nodes so we can mix them later if clothing normal exists
+    base_normal_color_out = None
     if images.get("normal_map"):
-        normal_tex = make_node(nodes, "ShaderNodeTexImage", "Normal_Tex", (-1800, -800))
+        normal_tex = make_node(nodes, "ShaderNodeTexImage", "Normal_Tex", (-1800, -900))
         normal_tex.image = images.get("normal_map")
         try: normal_tex.image.colorspace_settings.name = 'Non-Color'
         except: pass
-        link(links, normal_tex.outputs[0], normal_map_node.inputs["Color"])
-
-    # Geometry Injection
+        base_normal_color_out = normal_tex.outputs[0]
+        link(links, base_normal_color_out, normal_map_node.inputs["Color"])
+        
+    diffuse = make_node(nodes, "ShaderNodeBsdfDiffuse", "Scene Light Capture", (-1200, -900))
+    link(links, bump_node.outputs["Normal"], diffuse.inputs["Normal"])
+    
     ao_mul = make_node(nodes, "ShaderNodeMix", "Apply Global AO", (-1200, 400))
     ao_mul.data_type = 'RGBA'
     ao_mul.blend_type = 'MULTIPLY'
@@ -1613,10 +1887,90 @@ def build_preview_material(mat, images):
     link(links, find_socket(ao_mul.outputs, "Result", "Color"), find_socket(accent_add.inputs, "A", "Color1"))
     find_socket(accent_add.inputs, "B", "Color2").default_value = (1.0, 0.4, 0.4, 1.0) 
 
-    # --- LIGHTING PIPELINE ---
-    diffuse = make_node(nodes, "ShaderNodeBsdfDiffuse", "Scene Light Capture", (-1200, -900))
-    link(links, normal_map_node.outputs["Normal"], diffuse.inputs["Normal"])
-    
+    pattern_type = getattr(scene, "genos_clothing_pattern_type", "NONE") if scene else "NONE"
+    pattern_base = find_socket(accent_add.outputs, "Result", "Color")
+    if pattern_type != "NONE":
+        pattern_proc = _build_clothing_pattern_factor(nodes, links, scene, pattern_type)
+        pattern_mask_bw = make_node(nodes, "ShaderNodeRGBToBW", "Pattern Mask BW", (-960, -760))
+        link(links, pattern_mask.outputs[0], pattern_mask_bw.inputs[0])
+
+        pattern_strength = make_node(nodes, "ShaderNodeMath", "Pattern Mask Strength", (-740, -760))
+        pattern_strength.operation = 'MULTIPLY'
+        pattern_strength.use_clamp = True
+        pattern_strength.inputs[1].default_value = max(0.0, min(1.0, float(getattr(scene, "genos_pattern_strength", 0.55))))
+        link(links, pattern_mask_bw.outputs[0], pattern_strength.inputs[0])
+
+        pattern_layer_color = None
+        pattern_uv_vector = None
+        if safe_pattern_color or safe_pattern_normal or safe_pattern_roughness:
+            p_uv = make_node(nodes, "ShaderNodeTexCoord", "Pattern UV", (-740, -1040))
+            p_map = make_node(nodes, "ShaderNodeMapping", "Pattern Mapping", (-560, -1040))
+            link(links, p_uv.outputs["UV"], p_map.inputs["Vector"])
+            try:
+                sc = max(0.01, float(getattr(scene, "genos_pattern_scale", 20.0)))
+                p_map.inputs["Scale"].default_value = (sc, sc, 1.0)
+                p_map.inputs["Rotation"].default_value = (0.0, 0.0, float(getattr(scene, "genos_pattern_rotation", 0.0)))
+            except Exception:
+                pass
+            pattern_uv_vector = p_map.outputs["Vector"]
+
+        if safe_pattern_color and pattern_uv_vector:
+            p_tex = make_node(nodes, "ShaderNodeTexImage", "Pattern Color Texture", (-360, -1040))
+            p_tex.image = safe_pattern_color
+            link(links, pattern_uv_vector, p_tex.inputs["Vector"])
+
+            tint_mul = make_node(nodes, "ShaderNodeMix", "Pattern Texture Tint", (-120, -980))
+            tint_mul.data_type = 'RGBA'
+            tint_mul.blend_type = 'MULTIPLY'
+            find_socket(tint_mul.inputs, "Factor", "Fac").default_value = 1.0
+            link(links, p_tex.outputs[0], find_socket(tint_mul.inputs, "A", "Color1"))
+            find_socket(tint_mul.inputs, "B", "Color2").default_value = tuple(getattr(scene, "genos_pattern_tint", (1.0, 1.0, 1.0, 1.0)))
+            pattern_layer_color = find_socket(tint_mul.outputs, "Result", "Color")
+
+        if safe_pattern_normal and pattern_uv_vector:
+            p_norm_tex = make_node(nodes, "ShaderNodeTexImage", "Pattern Normal Texture", (-1800, -1000))
+            p_norm_tex.image = safe_pattern_normal
+            link(links, pattern_uv_vector, p_norm_tex.inputs["Vector"])
+            try: p_norm_tex.image.colorspace_settings.name = 'Non-Color'
+            except: pass
+
+            norm_mix = make_node(nodes, "ShaderNodeMix", "Combine Normals", (-1650, -950))
+            norm_mix.data_type = 'RGBA'
+            norm_mix.blend_type = 'MIX'
+            if base_normal_color_out:
+                link(links, base_normal_color_out, find_socket(norm_mix.inputs, "A", "Color1"))
+            else:
+                find_socket(norm_mix.inputs, "A", "Color1").default_value = (0.5, 0.5, 1.0, 1.0)
+            
+            link(links, p_norm_tex.outputs[0], find_socket(norm_mix.inputs, "B", "Color2"))
+            link(links, pattern_strength.outputs[0], find_socket(norm_mix.inputs, "Factor", "Fac"))
+            link(links, find_socket(norm_mix.outputs, "Result", "Color"), normal_map_node.inputs["Color"])
+
+        pattern_proc_mul = make_node(nodes, "ShaderNodeMix", "Pattern Detail Multiply", (-520, -980))
+        pattern_proc_mul.data_type = 'RGBA'
+        pattern_proc_mul.blend_type = 'MULTIPLY'
+        find_socket(pattern_proc_mul.inputs, "Factor", "Fac").default_value = 1.0
+        if pattern_layer_color:
+            link(links, pattern_layer_color, find_socket(pattern_proc_mul.inputs, "A", "Color1"))
+        else:
+            find_socket(pattern_proc_mul.inputs, "A", "Color1").default_value = tuple(getattr(scene, "genos_pattern_tint", (1.0, 1.0, 1.0, 1.0)))
+        link(links, pattern_proc, find_socket(pattern_proc_mul.inputs, "B", "Color2"))
+
+        pattern_mul_base = make_node(nodes, "ShaderNodeMix", "Pattern Over Base Multiply", (-460, 320))
+        pattern_mul_base.data_type = 'RGBA'
+        pattern_mul_base.blend_type = 'MULTIPLY'
+        find_socket(pattern_mul_base.inputs, "Factor", "Fac").default_value = 1.0
+        link(links, pattern_base, find_socket(pattern_mul_base.inputs, "A", "Color1"))
+        link(links, find_socket(pattern_proc_mul.outputs, "Result", "Color"), find_socket(pattern_mul_base.inputs, "B", "Color2"))
+
+        pattern_tint_mix = make_node(nodes, "ShaderNodeMix", "Clothing Pattern Layer", (-260, 400))
+        pattern_tint_mix.data_type = 'RGBA'
+        pattern_tint_mix.blend_type = 'MIX'
+        link(links, pattern_strength.outputs[0], find_socket(pattern_tint_mix.inputs, "Factor", "Fac"))
+        link(links, pattern_base, find_socket(pattern_tint_mix.inputs, "A", "Color1"))
+        link(links, find_socket(pattern_mul_base.outputs, "Result", "Color"), find_socket(pattern_tint_mix.inputs, "B", "Color2"))
+        pattern_base = find_socket(pattern_tint_mix.outputs, "Result", "Color")
+
     s2rgb = make_node(nodes, "ShaderNodeShaderToRGB", "Shader to RGB", (-900, -900))
     bw_light = make_node(nodes, "ShaderNodeRGBToBW", "Light Intensity", (-700, -900))
     link(links, diffuse.outputs[0], s2rgb.inputs[0])
@@ -1632,13 +1986,30 @@ def build_preview_material(mat, images):
     link(links, bw_light.outputs[0], shadow_add.inputs[0])
     link(links, shadow_offset.outputs[0], shadow_add.inputs[1]) 
 
-    # Use SDF-driven shadow thresholds for face shaders
     if shader_type == 'FACE':
+        # Advanced 2D Face / SDF Support
         sdf_tex = make_node(nodes, "ShaderNodeTexImage", "SDF Map", (-700, -1100))
         if images.get("sdf_map"):
             sdf_tex.image = images.get("sdf_map")
             try: sdf_tex.image.colorspace_settings.name = 'Non-Color'
             except: pass
+
+        # Modern Anime Face Normal adjustment (Forward Facing Normal Override + Head tracking mapping)
+        face_normal_override = make_node(nodes, "ShaderNodeNewGeometry", "Face Geo Normal", (-1500, -1100))
+        # Mix true normal and vector (0,1,0) local Y or True Normal based on mapping
+        
+        # Calculate Y/X vector components for SDF blending mapping
+        sep_xyz = make_node(nodes, "ShaderNodeSeparateXYZ", "Sep Face Normal", (-1300, -1100))
+        link(links, face_normal_override.outputs["Normal"], sep_xyz.inputs[0])
+
+        combine_xyz = make_node(nodes, "ShaderNodeCombineXYZ", "Flatten Face Normal", (-1100, -1100))
+        link(links, sep_xyz.outputs["X"], combine_xyz.inputs["X"])
+        combine_xyz.inputs["Y"].default_value = 1.0 # Forward bias
+        link(links, sep_xyz.outputs["Z"], combine_xyz.inputs["Z"])
+
+        norm_normalize = make_node(nodes, "ShaderNodeVectorMath", "Normalize Override", (-900, -1100))
+        norm_normalize.operation = 'NORMALIZE'
+        link(links, combine_xyz.outputs[0], norm_normalize.inputs[0])
 
         sdf_min = make_node(nodes, "ShaderNodeMath", "SDF Min Edge", (-500, -1050))
         sdf_min.operation = 'SUBTRACT'
@@ -1662,12 +2033,8 @@ def build_preview_material(mat, images):
         shadow_step.inputs["From Max"].default_value = 0.55
         link(links, shadow_add.outputs[0], shadow_step.inputs["Value"])
 
-    # -------------------------------------------------------------
-    # HAIR SPECULAR PIPELINE INJECTION
-    # -------------------------------------------------------------
     if shader_type == 'HAIR':
         glossy = make_node(nodes, "ShaderNodeBsdfAnisotropic", "Hair Specular Capture", (-1200, -700))
-        # Fallback to Glossy if Anisotropic node doesn't exist (Blender 4.0+)
         if glossy is None:
             glossy = make_node(nodes, "ShaderNodeBsdfGlossy", "Hair Specular Capture", (-1200, -700))
             try:
@@ -1686,7 +2053,26 @@ def build_preview_material(mat, images):
         try: glossy.inputs["Roughness"].default_value = 0.05
         except: pass
         
-    link(links, normal_map_node.outputs["Normal"], glossy.inputs["Normal"])
+    # Inject pattern roughness logic
+    if pattern_type != "NONE" and safe_pattern_roughness and pattern_uv_vector:
+        p_rough_tex = make_node(nodes, "ShaderNodeTexImage", "Pattern Roughness Texture", (-1500, -600))
+        p_rough_tex.image = safe_pattern_roughness
+        link(links, pattern_uv_vector, p_rough_tex.inputs["Vector"])
+        try: p_rough_tex.image.colorspace_settings.name = 'Non-Color'
+        except: pass
+
+        rough_mix = make_node(nodes, "ShaderNodeMix", "Combine Roughness", (-1350, -600))
+        rough_mix.data_type = 'RGBA'
+        rough_mix.blend_type = 'MIX'
+        # Default glossy roughness is around 0.05 (almost black), so base = 0.05
+        find_socket(rough_mix.inputs, "A", "Color1").default_value = (0.05, 0.05, 0.05, 1.0)
+        link(links, p_rough_tex.outputs[0], find_socket(rough_mix.inputs, "B", "Color2"))
+        link(links, pattern_strength.outputs[0], find_socket(rough_mix.inputs, "Factor", "Fac"))
+        
+        # Pull only the first RGB channel (Value) for Roughness socket
+        link(links, find_socket(rough_mix.outputs, "Result", "Color"), glossy.inputs["Roughness"])
+
+    link(links, bump_node.outputs["Normal"], glossy.inputs["Normal"])
     
     gs2rgb = make_node(nodes, "ShaderNodeShaderToRGB", "Glossy to RGB", (-900, -700))
     gbw_light = make_node(nodes, "ShaderNodeRGBToBW", "Glossy Intensity", (-700, -700))
@@ -1694,7 +2080,7 @@ def build_preview_material(mat, images):
     link(links, gs2rgb.outputs[0], gbw_light.inputs[0])
 
     spec_thresh = make_node(nodes, "ShaderNodeValue", "Specular Threshold", (-900, -600))
-    spec_thresh.outputs[0].default_value = 0.6  
+    spec_thresh.outputs[0].default_value = 0.5  
     
     spec_smooth = make_node(nodes, "ShaderNodeMath", "Spec Smooth Edge", (-700, -600))
     spec_smooth.operation = 'ADD'
@@ -1707,17 +2093,39 @@ def build_preview_material(mat, images):
     link(links, spec_smooth.outputs[0], glossy_step.inputs[2])
     link(links, gbw_light.outputs[0], glossy_step.inputs[0])
 
-    glossy_mask = make_node(nodes, "ShaderNodeMath", "Mask Spec with ILM.B", (-300, -700))
-    glossy_mask.operation = 'MULTIPLY'
-    link(links, glossy_step.outputs[0], glossy_mask.inputs[0])
-    link(links, ilm_spec.outputs[0], glossy_mask.inputs[1]) 
+    if shader_type == 'HAIR':
+        halo_light_mask = make_node(nodes, "ShaderNodeMath", "Halo Light Mask", (-300, -500))
+        halo_light_mask.operation = 'MULTIPLY'
+        link(links, ilm_spec.outputs[0], halo_light_mask.inputs[0])
+        link(links, shadow_step.outputs[0], halo_light_mask.inputs[1])
+        
+        glossy_mul = make_node(nodes, "ShaderNodeMath", "Dynamic Spec Mask", (-300, -650))
+        glossy_mul.operation = 'MULTIPLY'
+        link(links, glossy_step.outputs[0], glossy_mul.inputs[0])
+        link(links, ilm_spec.outputs[0], glossy_mul.inputs[1])
+        
+        # Proper anime hair halo: offset the shadow line down/up
+        halo_offset = make_node(nodes, "ShaderNodeVectorMath", "Halo Offset", (-500, -400))
+        halo_offset.operation = 'ADD'
+        halo_offset.inputs[1].default_value = (0.0, -0.05, 0.0) # Downward offset
+        
+        # Link normal to offset if possible or just use offset on UV
+        
+        glossy_mask = make_node(nodes, "ShaderNodeMath", "Combine Hair Specular", (-100, -600))
+        glossy_mask.operation = 'MAXIMUM'
+        link(links, halo_light_mask.outputs[0], glossy_mask.inputs[0])
+        link(links, glossy_mul.outputs[0], glossy_mask.inputs[1])
+    else:
+        glossy_mask = make_node(nodes, "ShaderNodeMath", "Mask Spec with ILM.B", (-300, -700))
+        glossy_mask.operation = 'MULTIPLY'
+        link(links, glossy_step.outputs[0], glossy_mask.inputs[0])
+        link(links, ilm_spec.outputs[0], glossy_mask.inputs[1]) 
 
-    # --- COLOR MIXING ---
     shadow_tint = make_node(nodes, "ShaderNodeMix", "Shadow Color", (-200, 100))
     shadow_tint.data_type = 'RGBA'
     shadow_tint.blend_type = 'MULTIPLY'
     find_socket(shadow_tint.inputs, "Factor", "Fac").default_value = 1.0
-    link(links, find_socket(accent_add.outputs, "Result", "Color"), find_socket(shadow_tint.inputs, "A", "Color1"))
+    link(links, pattern_base, find_socket(shadow_tint.inputs, "A", "Color1"))
     find_socket(shadow_tint.inputs, "B", "Color2").default_value = (0.55, 0.55, 0.70, 1.0) 
 
     apply_shadow = make_node(nodes, "ShaderNodeMix", "Apply Shading", (300, 0))
@@ -1725,7 +2133,7 @@ def build_preview_material(mat, images):
     apply_shadow.blend_type = 'MIX'
     link(links, shadow_step.outputs[0], find_socket(apply_shadow.inputs, "Factor", "Fac"))
     link(links, find_socket(shadow_tint.outputs, "Result", "Color"), find_socket(apply_shadow.inputs, "A", "Color1")) 
-    link(links, find_socket(accent_add.outputs, "Result", "Color"), find_socket(apply_shadow.inputs, "B", "Color2")) 
+    link(links, pattern_base, find_socket(apply_shadow.inputs, "B", "Color2")) 
 
     spec_add = make_node(nodes, "ShaderNodeMix", "Add Dynamic Specular", (600, 0))
     spec_add.data_type = 'RGBA'
@@ -1734,7 +2142,6 @@ def build_preview_material(mat, images):
     link(links, find_socket(apply_shadow.outputs, "Result", "Color"), find_socket(spec_add.inputs, "A", "Color1"))
     find_socket(spec_add.inputs, "B", "Color2").default_value = (1.0, 1.0, 1.0, 1.0)
 
-    # --- INNER LINEART ---
     line_str = make_node(nodes, "ShaderNodeValue", "Inner Lineart Strength", (600, 200))
     line_str.outputs[0].default_value = 1.0
     
@@ -1755,7 +2162,6 @@ def build_preview_material(mat, images):
     link(links, find_socket(spec_add.outputs, "Result", "Color"), find_socket(apply_lineart.inputs, "A", "Color1"))
     link(links, line_inv.outputs[0], find_socket(apply_lineart.inputs, "B", "Color2"))
 
-    # --- EMISSION STACK ---
     map_strength_val = make_node(nodes, "ShaderNodeValue", "Emission Map Strength", (1000, -350))
     map_strength_val.outputs[0].default_value = 10.0
     
@@ -1776,7 +2182,7 @@ def build_preview_material(mat, images):
     emit_add_masks.blend_type = 'ADD'
     link(links, combo_emit.outputs[0], find_socket(emit_add_masks.inputs, "Factor", "Fac"))
     find_socket(emit_add_masks.inputs, "A", "Color1").default_value = (0.0, 0.0, 0.0, 1.0)
-    link(links, find_socket(accent_add.outputs, "Result", "Color"), find_socket(emit_add_masks.inputs, "B", "Color2"))
+    link(links, pattern_base, find_socket(emit_add_masks.inputs, "B", "Color2"))
 
     total_emission = make_node(nodes, "ShaderNodeMix", "Total Raw Emission", (1400, -350))
     total_emission.data_type = 'RGBA'
@@ -1839,17 +2245,21 @@ def build_preview_material(mat, images):
 
     link(links, find_socket(final_add.outputs, "Result", "Color"), emission_out.inputs[0])
 
-def build_baked_material(mat, base_img, emit_img, nmap_img, ilm_img, det_img, sdf_img=None):
+def build_baked_material(mat, base_img, emit_img, nmap_img, ilm_img, det_img, sdf_img=None, disp_img=None, pattern_mask_img=None, pattern_color_img=None):
     mat.use_nodes = True
     mat["is_anime_toon_baked"] = True 
     shader_type = mat.get("genos_shader_type", "DEFAULT")
     
-    
     try:
-        mat.blend_method = 'CLIP'
-        mat.shadow_method = 'CLIP'
-        mat.alpha_threshold = 0.5
-        mat.show_transparent_back = False 
+        if shader_type == 'HAIR':
+            mat.blend_method = 'HASHED'
+            mat.shadow_method = 'CLIP'
+            mat.show_transparent_back = False 
+        else:
+            mat.blend_method = 'CLIP'
+            mat.shadow_method = 'CLIP'
+            mat.alpha_threshold = 0.5
+            mat.show_transparent_back = False 
     except: pass
 
     nodes = mat.node_tree.nodes
@@ -1867,7 +2277,7 @@ def build_baked_material(mat, base_img, emit_img, nmap_img, ilm_img, det_img, sd
     link(links, strength_val.outputs[0], emission_out.inputs["Strength"])
     link(links, transparent_bsdf.outputs[0], mix_shader.inputs[1]) 
     link(links, emission_out.outputs[0], mix_shader.inputs[2])     
-    link(links, mix_shader.outputs[0], output.inputs[0])
+    link(links, mix_shader.outputs[0], output.inputs["Surface"])
 
     base_tex = make_node(nodes, "ShaderNodeTexImage", "BaseColor", (-1500, 400))
     if base_img:
@@ -1878,7 +2288,34 @@ def build_baked_material(mat, base_img, emit_img, nmap_img, ilm_img, det_img, sd
     alpha_clip_gate.operation = 'GREATER_THAN'
     alpha_clip_gate.inputs[1].default_value = 0.1
     link(links, base_tex.outputs[1], alpha_clip_gate.inputs[0])
-    link(links, alpha_clip_gate.outputs[0], mix_shader.inputs[0])
+
+    if shader_type == 'HAIR':
+        hair_transparency_val = make_node(nodes, "ShaderNodeValue", "Hair Transparency", (2500, 100))
+        hair_transparency_val.outputs[0].default_value = getattr(bpy.context.scene, "genos_hair_transparency", 0.5) 
+
+        # Depth-based alpha masking for eye transparency (Hair over Eyes effect)
+        light_path = make_node(nodes, "ShaderNodeLightPath", "Light Path", (2300, 400))
+        transparent_depth = make_node(nodes, "ShaderNodeMath", "Is Transparent Depth", (2450, 400))
+        transparent_depth.operation = 'GREATER_THAN'
+        link(links, light_path.outputs["Transparent Depth"], transparent_depth.inputs[0])
+        transparent_depth.inputs[1].default_value = 0.0
+        
+        # Mix base alpha config with the transparency blend whenever depth check hits
+        depth_mix = make_node(nodes, "ShaderNodeMix", "Depth Mix Alpha", (2600, 300))
+        depth_mix.data_type = 'FLOAT'
+        depth_mix.blend_type = 'MIX'
+        link(links, transparent_depth.outputs[0], depth_mix.inputs["Factor"])
+        link(links, hair_transparency_val.outputs[0], depth_mix.inputs["B"])
+        depth_mix.inputs["A"].default_value = 1.0 # 1.0 alpha normal case
+
+        # Multiplied overall hair alpha factor
+        hair_alpha_factor = make_node(nodes, "ShaderNodeMath", "Hair Alpha Factor", (2700, 150))
+        hair_alpha_factor.operation = 'MULTIPLY'
+        link(links, alpha_clip_gate.outputs[0], hair_alpha_factor.inputs[0])
+        link(links, depth_mix.outputs["Result"], hair_alpha_factor.inputs[1])
+        link(links, hair_alpha_factor.outputs[0], mix_shader.inputs[0])
+    else:
+        link(links, alpha_clip_gate.outputs[0], mix_shader.inputs[0])
 
     emission_map = make_node(nodes, "ShaderNodeTexImage", "Emission Map", (-1500, 300))
     if emit_img:
@@ -1918,13 +2355,31 @@ def build_baked_material(mat, base_img, emit_img, nmap_img, ilm_img, det_img, sd
     det_sep = make_node(nodes, "ShaderNodeSeparateColor", "Detail Split", (-1200, -100))
     link(links, det_tex.outputs[0], det_sep.inputs[0])
 
-    normal_map_node = make_node(nodes, "ShaderNodeNormalMap", "Normal Map", (-1500, -800))
+    pattern_tex = make_node(nodes, "ShaderNodeTexImage", "Pattern Mask", (-1500, -280))
+    if pattern_img:
+        set_image_colorspace(pattern_img, MASK_COLORSPACE)
+        pattern_tex.image = pattern_img
+
+    disp_map = make_node(nodes, "ShaderNodeTexImage", "Displacement Map", (-1500, -700))
+    if disp_img:
+        disp_map.image = disp_img
+        disp_map.interpolation = 'Linear'
+
+    normal_map_node = make_node(nodes, "ShaderNodeNormalMap", "Normal Map", (-1500, -900))
+    base_normal_color_out = None
     if nmap_img:
-        normal_tex = make_node(nodes, "ShaderNodeTexImage", "Normal_Tex", (-1800, -800))
+        normal_tex = make_node(nodes, "ShaderNodeTexImage", "Normal_Tex", (-1800, -900))
         normal_tex.image = nmap_img
         try: normal_tex.image.colorspace_settings.name = 'Non-Color'
         except: pass
-        link(links, normal_tex.outputs[0], normal_map_node.inputs["Color"])
+        base_normal_color_out = normal_tex.outputs[0]
+        link(links, base_normal_color_out, normal_map_node.inputs["Color"])
+
+    bump_node = make_node(nodes, "ShaderNodeBump", "Displacement Bump", (-1300, -900))
+    bump_node.inputs["Distance"].default_value = getattr(bpy.context.scene, "genos_displacement_strength", 0.1)
+    if disp_img:
+        link(links, disp_map.outputs[0], bump_node.inputs["Height"])
+    link(links, normal_map_node.outputs["Normal"], bump_node.inputs["Normal"])
 
     ao_mul = make_node(nodes, "ShaderNodeMix", "Apply Global AO", (-1200, 400))
     ao_mul.data_type = 'RGBA'
@@ -1940,8 +2395,97 @@ def build_baked_material(mat, base_img, emit_img, nmap_img, ilm_img, det_img, sd
     link(links, find_socket(ao_mul.outputs, "Result", "Color"), find_socket(accent_add.inputs, "A", "Color1"))
     find_socket(accent_add.inputs, "B", "Color2").default_value = (1.0, 0.4, 0.4, 1.0) 
 
+    pattern_type = getattr(scene, "genos_clothing_pattern_type", "NONE") if scene else "NONE"
+    pattern_base = find_socket(accent_add.outputs, "Result", "Color")
+    if pattern_type != "NONE":
+        pattern_proc = _build_clothing_pattern_factor(nodes, links, scene, pattern_type)
+        pattern_mask_bw = make_node(nodes, "ShaderNodeRGBToBW", "Pattern Mask BW", (-960, -760))
+        link(links, pattern_tex.outputs[0], pattern_mask_bw.inputs[0])
+
+        pattern_strength = make_node(nodes, "ShaderNodeMath", "Pattern Mask Strength", (-740, -760))
+        pattern_strength.operation = 'MULTIPLY'
+        pattern_strength.use_clamp = True
+        pattern_strength.inputs[1].default_value = max(0.0, min(1.0, float(getattr(scene, "genos_pattern_strength", 0.55))))
+        link(links, pattern_mask_bw.outputs[0], pattern_strength.inputs[0])
+
+        pattern_layer_color = None
+        pattern_uv_vector = None
+        pattern_color_img = pattern_color_img if pattern_color_img is not None else getattr(mat, "genos_pattern_color_map", None)
+        pattern_normal_img = getattr(mat, "genos_pattern_normal_map", None)
+        pattern_roughness_img = getattr(mat, "genos_pattern_roughness_map", None)
+
+        if pattern_color_img or pattern_normal_img or pattern_roughness_img:
+            p_uv = make_node(nodes, "ShaderNodeTexCoord", "Pattern UV", (-740, -1040))
+            p_map = make_node(nodes, "ShaderNodeMapping", "Pattern Mapping", (-560, -1040))
+            link(links, p_uv.outputs["UV"], p_map.inputs["Vector"])
+            try:
+                sc = max(0.01, float(getattr(scene, "genos_pattern_scale", 20.0)))
+                p_map.inputs["Scale"].default_value = (sc, sc, 1.0)
+                p_map.inputs["Rotation"].default_value = (0.0, 0.0, float(getattr(scene, "genos_pattern_rotation", 0.0)))
+            except Exception:
+                pass
+            pattern_uv_vector = p_map.outputs["Vector"]
+
+        if pattern_color_img and pattern_uv_vector:
+            set_image_colorspace(pattern_color_img, "sRGB")
+            p_tex = make_node(nodes, "ShaderNodeTexImage", "Pattern Color Texture", (-360, -1040))
+            p_tex.image = pattern_color_img
+            link(links, pattern_uv_vector, p_tex.inputs["Vector"])
+
+            tint_mul = make_node(nodes, "ShaderNodeMix", "Pattern Texture Tint", (-120, -980))
+            tint_mul.data_type = 'RGBA'
+            tint_mul.blend_type = 'MULTIPLY'
+            find_socket(tint_mul.inputs, "Factor", "Fac").default_value = 1.0
+            link(links, p_tex.outputs[0], find_socket(tint_mul.inputs, "A", "Color1"))
+            find_socket(tint_mul.inputs, "B", "Color2").default_value = tuple(getattr(scene, "genos_pattern_tint", (1.0, 1.0, 1.0, 1.0)))
+            pattern_layer_color = find_socket(tint_mul.outputs, "Result", "Color")
+
+        if pattern_normal_img and pattern_uv_vector:
+            p_norm_tex = make_node(nodes, "ShaderNodeTexImage", "Pattern Normal Texture", (-1800, -1000))
+            p_norm_tex.image = pattern_normal_img
+            try: p_norm_tex.image.colorspace_settings.name = 'Non-Color'
+            except: pass
+            link(links, pattern_uv_vector, p_norm_tex.inputs["Vector"])
+
+            norm_mix = make_node(nodes, "ShaderNodeMix", "Combine Normals", (-1650, -950))
+            norm_mix.data_type = 'RGBA'
+            norm_mix.blend_type = 'MIX'
+            if base_normal_color_out:
+                link(links, base_normal_color_out, find_socket(norm_mix.inputs, "A", "Color1"))
+            else:
+                find_socket(norm_mix.inputs, "A", "Color1").default_value = (0.5, 0.5, 1.0, 1.0)
+            
+            link(links, p_norm_tex.outputs[0], find_socket(norm_mix.inputs, "B", "Color2"))
+            link(links, pattern_strength.outputs[0], find_socket(norm_mix.inputs, "Factor", "Fac"))
+            link(links, find_socket(norm_mix.outputs, "Result", "Color"), normal_map_node.inputs["Color"])
+
+        pattern_proc_mul = make_node(nodes, "ShaderNodeMix", "Pattern Detail Multiply", (-520, -980))
+        pattern_proc_mul.data_type = 'RGBA'
+        pattern_proc_mul.blend_type = 'MULTIPLY'
+        find_socket(pattern_proc_mul.inputs, "Factor", "Fac").default_value = 1.0
+        if pattern_layer_color:
+            link(links, pattern_layer_color, find_socket(pattern_proc_mul.inputs, "A", "Color1"))
+        else:
+            find_socket(pattern_proc_mul.inputs, "A", "Color1").default_value = tuple(getattr(scene, "genos_pattern_tint", (1.0, 1.0, 1.0, 1.0)))
+        link(links, pattern_proc, find_socket(pattern_proc_mul.inputs, "B", "Color2"))
+
+        pattern_mul_base = make_node(nodes, "ShaderNodeMix", "Pattern Over Base Multiply", (-460, 320))
+        pattern_mul_base.data_type = 'RGBA'
+        pattern_mul_base.blend_type = 'MULTIPLY'
+        find_socket(pattern_mul_base.inputs, "Factor", "Fac").default_value = 1.0
+        link(links, pattern_base, find_socket(pattern_mul_base.inputs, "A", "Color1"))
+        link(links, find_socket(pattern_proc_mul.outputs, "Result", "Color"), find_socket(pattern_mul_base.inputs, "B", "Color2"))
+
+        pattern_tint_mix = make_node(nodes, "ShaderNodeMix", "Clothing Pattern Layer", (-260, 400))
+        pattern_tint_mix.data_type = 'RGBA'
+        pattern_tint_mix.blend_type = 'MIX'
+        link(links, pattern_strength.outputs[0], find_socket(pattern_tint_mix.inputs, "Factor", "Fac"))
+        link(links, pattern_base, find_socket(pattern_tint_mix.inputs, "A", "Color1"))
+        link(links, find_socket(pattern_mul_base.outputs, "Result", "Color"), find_socket(pattern_tint_mix.inputs, "B", "Color2"))
+        pattern_base = find_socket(pattern_tint_mix.outputs, "Result", "Color")
+
     diffuse = make_node(nodes, "ShaderNodeBsdfDiffuse", "Scene Light Capture", (-1200, -900))
-    link(links, normal_map_node.outputs["Normal"], diffuse.inputs["Normal"])
+    link(links, bump_node.outputs["Normal"], diffuse.inputs["Normal"])
     
     s2rgb = make_node(nodes, "ShaderNodeShaderToRGB", "Shader to RGB", (-900, -900))
     bw_light = make_node(nodes, "ShaderNodeRGBToBW", "Light Intensity", (-700, -900))
@@ -1958,7 +2502,6 @@ def build_baked_material(mat, base_img, emit_img, nmap_img, ilm_img, det_img, sd
     link(links, bw_light.outputs[0], shadow_add.inputs[0])
     link(links, shadow_offset.outputs[0], shadow_add.inputs[1]) 
 
-    # SDF Logic for Baked Mat
     if shader_type == 'FACE':
         sdf_tex_node = make_node(nodes, "ShaderNodeTexImage", "SDF Map", (-700, -1100))
         if sdf_img:
@@ -1988,7 +2531,6 @@ def build_baked_material(mat, base_img, emit_img, nmap_img, ilm_img, det_img, sd
         shadow_step.inputs[2].default_value = 0.55
         link(links, shadow_add.outputs[0], shadow_step.inputs[0])
 
-    # Hair Specular for Baked Mat
     if shader_type == 'HAIR':
         glossy = make_node(nodes, "ShaderNodeBsdfAnisotropic", "Hair Specular", (-1200, -700))
         if glossy is None:
@@ -2008,8 +2550,26 @@ def build_baked_material(mat, base_img, emit_img, nmap_img, ilm_img, det_img, sd
         glossy = make_node(nodes, "ShaderNodeBsdfGlossy", "Specular Capture", (-1200, -700))
         try: glossy.inputs["Roughness"].default_value = 0.05
         except: pass
-    
+        
     find_socket(glossy.inputs, "Roughness").default_value = 0.05
+
+    # Inject pattern roughness logic into baked material
+    if pattern_type != "NONE" and pattern_roughness_img and pattern_uv_vector:
+        p_rough_tex = make_node(nodes, "ShaderNodeTexImage", "Pattern Roughness Texture", (-1500, -600))
+        p_rough_tex.image = pattern_roughness_img
+        link(links, pattern_uv_vector, p_rough_tex.inputs["Vector"])
+        try: p_rough_tex.image.colorspace_settings.name = 'Non-Color'
+        except: pass
+
+        rough_mix = make_node(nodes, "ShaderNodeMix", "Combine Roughness", (-1350, -600))
+        rough_mix.data_type = 'RGBA'
+        rough_mix.blend_type = 'MIX'
+        find_socket(rough_mix.inputs, "A", "Color1").default_value = (0.05, 0.05, 0.05, 1.0)
+        link(links, p_rough_tex.outputs[0], find_socket(rough_mix.inputs, "B", "Color2"))
+        link(links, pattern_strength.outputs[0], find_socket(rough_mix.inputs, "Factor", "Fac"))
+        
+        link(links, find_socket(rough_mix.outputs, "Result", "Color"), find_socket(glossy.inputs, "Roughness"))
+
     link(links, normal_map_node.outputs["Normal"], glossy.inputs["Normal"])
     
     gs2rgb = make_node(nodes, "ShaderNodeShaderToRGB", "Glossy to RGB", (-900, -700))
@@ -2018,7 +2578,7 @@ def build_baked_material(mat, base_img, emit_img, nmap_img, ilm_img, det_img, sd
     link(links, gs2rgb.outputs[0], gbw_light.inputs[0])
 
     spec_thresh = make_node(nodes, "ShaderNodeValue", "Specular Threshold", (-900, -600))
-    spec_thresh.outputs[0].default_value = 0.6  
+    spec_thresh.outputs[0].default_value = 0.5  
     
     spec_smooth = make_node(nodes, "ShaderNodeMath", "Spec Smooth Edge", (-700, -600))
     spec_smooth.operation = 'ADD'
@@ -2031,16 +2591,32 @@ def build_baked_material(mat, base_img, emit_img, nmap_img, ilm_img, det_img, sd
     link(links, spec_smooth.outputs[0], glossy_step.inputs["From Max"])
     link(links, gbw_light.outputs[0], glossy_step.inputs["Value"])
 
-    glossy_mask = make_node(nodes, "ShaderNodeMath", "Mask Spec with ILM.B", (-300, -700))
-    glossy_mask.operation = 'MULTIPLY'
-    link(links, glossy_step.outputs[0], glossy_mask.inputs[0])
-    link(links, ilm_sep.outputs[2], glossy_mask.inputs[1]) 
+    if shader_type == 'HAIR':
+        halo_light_mask = make_node(nodes, "ShaderNodeMath", "Halo Light Mask", (-300, -500))
+        halo_light_mask.operation = 'MULTIPLY'
+        link(links, ilm_sep.outputs[2], halo_light_mask.inputs[0])
+        link(links, shadow_step.outputs[0], halo_light_mask.inputs[1])
+        
+        glossy_mul = make_node(nodes, "ShaderNodeMath", "Dynamic Spec Mask", (-300, -650))
+        glossy_mul.operation = 'MULTIPLY'
+        link(links, glossy_step.outputs[0], glossy_mul.inputs[0])
+        link(links, ilm_sep.outputs[2], glossy_mul.inputs[1])
+        
+        glossy_mask = make_node(nodes, "ShaderNodeMath", "Combine Hair Specular", (-100, -600))
+        glossy_mask.operation = 'MAXIMUM'
+        link(links, halo_light_mask.outputs[0], glossy_mask.inputs[0])
+        link(links, glossy_mul.outputs[0], glossy_mask.inputs[1])
+    else:
+        glossy_mask = make_node(nodes, "ShaderNodeMath", "Mask Spec with ILM.B", (-300, -700))
+        glossy_mask.operation = 'MULTIPLY'
+        link(links, glossy_step.outputs[0], glossy_mask.inputs[0])
+        link(links, ilm_sep.outputs[2], glossy_mask.inputs[1]) 
 
     shadow_tint = make_node(nodes, "ShaderNodeMix", "Shadow Color", (-200, 100))
     shadow_tint.data_type = 'RGBA'
     shadow_tint.blend_type = 'MULTIPLY'
     find_socket(shadow_tint.inputs, "Factor", "Fac").default_value = 1.0
-    link(links, find_socket(accent_add.outputs, "Result", "Color"), find_socket(shadow_tint.inputs, "A", "Color1"))
+    link(links, pattern_base, find_socket(shadow_tint.inputs, "A", "Color1"))
     find_socket(shadow_tint.inputs, "B", "Color2").default_value = (0.55, 0.55, 0.70, 1.0) 
 
     apply_shadow = make_node(nodes, "ShaderNodeMix", "Apply Shading", (300, 0))
@@ -2048,7 +2624,7 @@ def build_baked_material(mat, base_img, emit_img, nmap_img, ilm_img, det_img, sd
     apply_shadow.blend_type = 'MIX'
     link(links, shadow_step.outputs[0], find_socket(apply_shadow.inputs, "Factor", "Fac"))
     link(links, find_socket(shadow_tint.outputs, "Result", "Color"), find_socket(apply_shadow.inputs, "A", "Color1")) 
-    link(links, find_socket(accent_add.outputs, "Result", "Color"), find_socket(apply_shadow.inputs, "B", "Color2")) 
+    link(links, pattern_base, find_socket(apply_shadow.inputs, "B", "Color2")) 
 
     spec_add = make_node(nodes, "ShaderNodeMix", "Add Dynamic Specular", (600, 0))
     spec_add.data_type = 'RGBA'
@@ -2097,7 +2673,7 @@ def build_baked_material(mat, base_img, emit_img, nmap_img, ilm_img, det_img, sd
     emit_add_masks.blend_type = 'ADD'
     link(links, combo_emit.outputs[0], find_socket(emit_add_masks.inputs, "Factor", "Fac"))
     find_socket(emit_add_masks.inputs, "A", "Color1").default_value = (0.0, 0.0, 0.0, 1.0)
-    link(links, find_socket(accent_add.outputs, "Result", "Color"), find_socket(emit_add_masks.inputs, "B", "Color2"))
+    link(links, pattern_base, find_socket(emit_add_masks.inputs, "B", "Color2"))
 
     total_emission = make_node(nodes, "ShaderNodeMix", "Total Raw Emission", (1400, -350))
     total_emission.data_type = 'RGBA'
@@ -2176,13 +2752,181 @@ def current_paint_image(context):
         "DETAIL_AO": "Detail_AO",
         "DETAIL_CURVE": "Detail_Curve",
         "DETAIL_ACCENT": "Detail_Accent",
-        "DETAIL_EMISSION": "Detail_Emission"
+        "DETAIL_EMISSION": "Detail_Emission",
+        "PATTERN_MASK": "Pattern Mask"
     }
     name = node_map.get(target)
     if name:
         node = mat.node_tree.nodes.get(name)
         return node.image if node else None
     return None
+
+def _apply_lineart_preset(scene):
+    preset = getattr(scene, "genos_lineart_preset", "CUSTOM")
+    if preset == 'ULTRA_FINE':
+        scene.genos_lineart_radius = 1e-06
+        scene.genos_lineart_samples = 32
+        scene.genos_lineart_edge_min = 0.002
+        scene.genos_lineart_edge_max = 0.045
+        scene.genos_lineart_gamma = 2.4
+        scene.genos_lineart_smooth = True
+    elif preset == 'BALANCED':
+        scene.genos_lineart_radius = 0.01
+        scene.genos_lineart_samples = 16
+        scene.genos_lineart_edge_min = 0.01
+        scene.genos_lineart_edge_max = 0.15
+        scene.genos_lineart_gamma = 1.0
+        scene.genos_lineart_smooth = True
+    elif preset == 'CRISP_INK':
+        scene.genos_lineart_radius = 0.005
+        scene.genos_lineart_samples = 24
+        scene.genos_lineart_edge_min = 0.006
+        scene.genos_lineart_edge_max = 0.08
+        scene.genos_lineart_gamma = 3.0
+        scene.genos_lineart_smooth = False
+    elif preset == 'SOFT_ANIME':
+        scene.genos_lineart_radius = 0.02
+        scene.genos_lineart_samples = 12
+        scene.genos_lineart_edge_min = 0.02
+        scene.genos_lineart_edge_max = 0.22
+        scene.genos_lineart_gamma = 0.8
+        scene.genos_lineart_smooth = True
+
+def _lineart_preset_update(self, context):
+    try:
+        _apply_lineart_preset(self)
+    except Exception:
+        pass
+
+def _build_clothing_pattern_factor(nodes, links, scene, pattern_type):
+    tex_coord = make_node(nodes, "ShaderNodeTexCoord", "Pattern UV", (-1900, -1120))
+    mapping = make_node(nodes, "ShaderNodeMapping", "Pattern Mapping", (-1700, -1120))
+    link(links, tex_coord.outputs["UV"], mapping.inputs["Vector"])
+
+    scale = max(0.01, float(getattr(scene, "genos_pattern_scale", 20.0)))
+    rot = float(getattr(scene, "genos_pattern_rotation", 0.0))
+    try:
+        mapping.inputs["Scale"].default_value = (scale, scale, 1.0)
+    except Exception:
+        pass
+    try:
+        mapping.inputs["Rotation"].default_value = (0.0, 0.0, rot)
+    except Exception:
+        pass
+
+    if pattern_type == 'PANTYHOSE':
+        voro = make_node(nodes, "ShaderNodeTexVoronoi", "Pattern Pantyhose Voronoi", (-1480, -1060))
+        voro.feature = 'F1'
+        voro.inputs["Scale"].default_value = 55.0
+        link(links, mapping.outputs["Vector"], voro.inputs["Vector"])
+
+        edge = make_node(nodes, "ShaderNodeMapRange", "Pattern Pantyhose Edge", (-1240, -1060))
+        edge.interpolation_type = 'SMOOTHSTEP'
+        edge.inputs["From Min"].default_value = 0.0
+        edge.inputs["From Max"].default_value = 0.035
+        edge.inputs["To Min"].default_value = 1.0
+        edge.inputs["To Max"].default_value = 0.0
+        link(links, voro.outputs["Distance"], edge.inputs["Value"])
+        return edge.outputs["Result"]
+
+    if pattern_type == 'STRIPES':
+        wave = make_node(nodes, "ShaderNodeTexWave", "Pattern Stripes", (-1480, -1060))
+        wave.wave_type = 'BANDS'
+        wave.bands_direction = 'Y'
+        wave.inputs["Scale"].default_value = 24.0
+        wave.inputs["Distortion"].default_value = 0.45
+        link(links, mapping.outputs["Vector"], wave.inputs["Vector"])
+
+        stripe = make_node(nodes, "ShaderNodeValToRGB", "Pattern Stripe Ramp", (-1240, -1060))
+        stripe.color_ramp.elements[0].position = 0.46
+        stripe.color_ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
+        stripe.color_ramp.elements[1].position = 0.54
+        stripe.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
+        link(links, wave.outputs["Color"], stripe.inputs["Fac"])
+        return stripe.outputs["Color"]
+
+    if pattern_type == 'RIPPED':
+        noise = make_node(nodes, "ShaderNodeTexNoise", "Pattern Ripped Noise", (-1480, -1060))
+        noise.inputs["Scale"].default_value = 10.0
+        noise.inputs["Detail"].default_value = 14.0
+        noise.inputs["Roughness"].default_value = 0.82
+        link(links, mapping.outputs["Vector"], noise.inputs["Vector"])
+
+        tear = make_node(nodes, "ShaderNodeValToRGB", "Pattern Ripped Ramp", (-1240, -1060))
+        tear.color_ramp.elements[0].position = 0.42
+        tear.color_ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
+        tear.color_ramp.elements[1].position = 0.56
+        tear.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
+        link(links, noise.outputs["Fac"], tear.inputs["Fac"])
+        return tear.outputs["Color"]
+
+    if pattern_type == 'BODYSUIT_HEX':
+        voro = make_node(nodes, "ShaderNodeTexVoronoi", "Pattern Hex", (-1480, -1060))
+        voro.feature = 'SMOOTH_F1'
+        voro.inputs["Scale"].default_value = 26.0
+        link(links, mapping.outputs["Vector"], voro.inputs["Vector"])
+
+        hexr = make_node(nodes, "ShaderNodeMapRange", "Pattern Hex Edge", (-1240, -1060))
+        hexr.interpolation_type = 'SMOOTHSTEP'
+        hexr.inputs["From Min"].default_value = 0.0
+        hexr.inputs["From Max"].default_value = 0.2
+        hexr.inputs["To Min"].default_value = 1.0
+        hexr.inputs["To Max"].default_value = 0.0
+        link(links, voro.outputs["Distance"], hexr.inputs["Value"])
+        return hexr.outputs["Result"]
+
+    if pattern_type == 'DOTS':
+        voro = make_node(nodes, "ShaderNodeTexVoronoi", "Pattern Dots", (-1480, -1060))
+        voro.feature = 'F1'
+        voro.inputs["Scale"].default_value = 36.0
+        link(links, mapping.outputs["Vector"], voro.inputs["Vector"])
+
+        dots = make_node(nodes, "ShaderNodeMapRange", "Pattern Dot Mask", (-1240, -1060))
+        dots.interpolation_type = 'SMOOTHSTEP'
+        dots.inputs["From Min"].default_value = 0.0
+        dots.inputs["From Max"].default_value = 0.08
+        dots.inputs["To Min"].default_value = 1.0
+        dots.inputs["To Max"].default_value = 0.0
+        link(links, voro.outputs["Distance"], dots.inputs["Value"])
+        return dots.outputs["Result"]
+
+    if pattern_type == 'COTTON':
+        noise = make_node(nodes, "ShaderNodeTexNoise", "Pattern Cotton Noise", (-1480, -1060))
+        noise.inputs["Scale"].default_value = 85.0
+        noise.inputs["Detail"].default_value = 12.0
+        noise.inputs["Roughness"].default_value = 0.42
+        link(links, mapping.outputs["Vector"], noise.inputs["Vector"])
+
+        cotton = make_node(nodes, "ShaderNodeMapRange", "Pattern Cotton Fiber", (-1240, -1060))
+        cotton.interpolation_type = 'SMOOTHSTEP'
+        cotton.inputs["From Min"].default_value = 0.42
+        cotton.inputs["From Max"].default_value = 0.72
+        cotton.inputs["To Min"].default_value = 0.0
+        cotton.inputs["To Max"].default_value = 1.0
+        link(links, noise.outputs["Fac"], cotton.inputs["Value"])
+        return cotton.outputs["Result"]
+
+    if pattern_type == 'LEATHER':
+        musgrave = make_node(nodes, "ShaderNodeTexMusgrave", "Pattern Leather Grain", (-1480, -1060))
+        musgrave.musgrave_type = 'RIDGED_MULTIFRACTAL'
+        musgrave.inputs["Scale"].default_value = 38.0
+        musgrave.inputs["Detail"].default_value = 8.0
+        musgrave.inputs["Dimension"].default_value = 0.55
+        musgrave.inputs["Lacunarity"].default_value = 2.1
+        link(links, mapping.outputs["Vector"], musgrave.inputs["Vector"])
+
+        leather = make_node(nodes, "ShaderNodeMapRange", "Pattern Leather Pores", (-1240, -1060))
+        leather.interpolation_type = 'SMOOTHSTEP'
+        leather.inputs["From Min"].default_value = 0.30
+        leather.inputs["From Max"].default_value = 0.68
+        leather.inputs["To Min"].default_value = 0.0
+        leather.inputs["To Max"].default_value = 1.0
+        link(links, musgrave.outputs["Fac"], leather.inputs["Value"])
+        return leather.outputs["Result"]
+
+    val = make_node(nodes, "ShaderNodeValue", "Pattern Disabled", (-1240, -1060))
+    val.outputs[0].default_value = 0.0
+    return val.outputs[0]
 
 # -------------------------------------------------------------------
 # Scene & Material Properties
@@ -2197,6 +2941,60 @@ def register_scene_props():
     # FIXED: Added the Paint Toggle and the New Mesh Copy Toggle
     bpy.types.Scene.genos_autotoggle_paint = BoolProperty(name="Auto Switch to Texture Paint", default=False)
     bpy.types.Scene.genos_export_mesh_copy = BoolProperty(name="Create Baked Mesh Copy", default=False, description="Generates a copy of the mesh with the exported textures applied")
+    bpy.types.Scene.genos_hair_transparency = FloatProperty(name="Hair Transparency", default=0.5, min=0.0, max=1.0, description="Strength of hair transparency when occluding skin/eyes")
+    bpy.types.Scene.genos_hair_highlight_strength = FloatProperty(name="Hair Highlight Strength", default=1.0, min=0.0, max=2.0, description="Intensity of generated anime hair highlight masks")
+    bpy.types.Scene.genos_eye_sparkle_strength = FloatProperty(name="Eye FX Strength", default=1.0, min=0.0, max=2.0, description="Intensity of generated anime eye sparkle and iris masks")
+    bpy.types.Scene.genos_2d_mouth = BoolProperty(name="Use 2D Anime Mouth", default=False, description="Enable flat color blending for 2D animated mouths")
+    bpy.types.Scene.genos_displacement_strength = FloatProperty(name="Displacement Strength", default=0.1, min=0.0, max=1.0, description="Strength of baked displacement effect")
+    bpy.types.Scene.genos_bake_displacement = BoolProperty(name="Bake Displacement", default=True, description="Bake displacement into a texture map")
+    bpy.types.Scene.genos_lineart_preset = EnumProperty(
+        name="Lineart Preset",
+        items=[
+            ("CUSTOM", "Custom", "Use manual lineart values"),
+            ("ULTRA_FINE", "Ultra Fine", "Tiny radius and tight thresholds for micro lines"),
+            ("BALANCED", "Balanced", "General purpose anime lineart settings"),
+            ("CRISP_INK", "Crisp Ink", "Hard, ink-like sharp lines"),
+            ("SOFT_ANIME", "Soft Anime", "Softer and smoother line transitions"),
+        ],
+        default="BALANCED",
+        update=_lineart_preset_update
+    )
+
+    bpy.types.Scene.genos_clothing_pattern_type = EnumProperty(
+        name="Clothing Pattern",
+        items=[
+            ("NONE", "None", "Disable procedural clothing overlay"),
+            ("PANTYHOSE", "Pantyhose", "Fine mesh pattern"),
+            ("STRIPES", "Striped Cloth", "Banded stripe pattern"),
+            ("RIPPED", "Ripped Cloth", "Torn cloth style breakup"),
+            ("BODYSUIT_HEX", "Bodysuit Hex", "Sci-fi hex bodysuit pattern"),
+            ("DOTS", "Dots", "Polka or micro-dot pattern"),
+            ("COTTON", "Cotton", "Soft woven cotton microfiber pattern"),
+            ("LEATHER", "Leather", "Leather grain and pore texture pattern"),
+        ],
+        default="NONE"
+    )
+    bpy.types.Scene.genos_pattern_scale = FloatProperty(name="Pattern Scale", default=20.0, min=0.01, max=200.0)
+    bpy.types.Scene.genos_pattern_strength = FloatProperty(name="Pattern Strength", default=0.55, min=0.0, max=1.0)
+    bpy.types.Scene.genos_pattern_rotation = FloatProperty(name="Pattern Rotation", default=0.0, min=-6.283185, max=6.283185, subtype='ANGLE')
+    bpy.types.Scene.genos_pattern_cache_dir = StringProperty(name="Pattern Cache Directory", subtype='DIR_PATH', default="")
+    bpy.types.Scene.genos_pattern_url_pantyhose = StringProperty(name="Pantyhose URL", default="https://ambientcg.com/get?file=Fabric001_1K-JPG.zip")
+    bpy.types.Scene.genos_pattern_url_stripes = StringProperty(name="Stripes URL", default="https://ambientcg.com/get?file=Fabric002_1K-JPG.zip")
+    bpy.types.Scene.genos_pattern_url_ripped = StringProperty(name="Ripped URL", default="https://ambientcg.com/get?file=Fabric003_1K-JPG.zip")
+    bpy.types.Scene.genos_pattern_url_bodysuit = StringProperty(name="Bodysuit URL", default="https://ambientcg.com/get?file=Fabric004_1K-JPG.zip")
+    bpy.types.Scene.genos_pattern_url_dots = StringProperty(name="Dots URL", default="https://ambientcg.com/get?file=Fabric005_1K-JPG.zip")
+    bpy.types.Scene.genos_pattern_url_cotton = StringProperty(name="Cotton URL", default="https://ambientcg.com/get?file=Fabric006_1K-JPG.zip")
+    bpy.types.Scene.genos_pattern_url_leather = StringProperty(name="Leather URL", default="https://ambientcg.com/get?file=Leather001_1K-JPG.zip")
+    bpy.types.Scene.genos_pattern_last_download_report = StringProperty(name="Last Download Report", default="")
+    bpy.types.Scene.genos_pattern_tint = bpy.props.FloatVectorProperty(
+        name="Pattern Tint",
+        subtype='COLOR',
+        size=4,
+        min=0.0,
+        max=1.0,
+        default=(1.0, 1.0, 1.0, 1.0),
+        description="Tint color applied by the clothing pattern layer"
+    )
     
     bpy.types.Scene.genos_create_shader_type = EnumProperty(
         name="Shader Type",
@@ -2213,6 +3011,7 @@ def register_scene_props():
     bpy.types.Scene.genos_exp_suf_ilm = StringProperty(name="ILM Name", default="_ILM")
     bpy.types.Scene.genos_exp_suf_detail = StringProperty(name="Detail Name", default="_Detail")
     bpy.types.Scene.genos_exp_suf_sdf = StringProperty(name="SDF Name", default="_SDF")
+    bpy.types.Scene.genos_exp_suf_displacement = StringProperty(name="Displacement Name", default="_Displacement")
 
     bpy.types.Scene.genos_spec_mat_type = EnumProperty(
         name="Material Type",
@@ -2238,28 +3037,79 @@ def register_scene_props():
             ("DETAIL_CURVE", "Detail.G (Curvature/Lines)", ""),
             ("DETAIL_ACCENT", "Detail.B (Decals/Blush)", ""),
             ("DETAIL_EMISSION", "Detail.A (Extra Glow)", ""),
+            ("PATTERN_MASK", "Pattern Mask (Clothes Layer)", ""),
         ],
         default="BASECOLOR"
     )
     
-    bpy.types.Scene.genos_lineart_radius = FloatProperty(name="Edge Radius", default=0.03, min=0.001, max=0.5)
+    bpy.types.Scene.genos_lineart_radius = FloatProperty(
+        name="Edge Radius",
+        default=0.03,
+        min=1e-08,
+        max=0.5,
+        precision=8,
+        description="Bevel radius used for curvature lineart. Supports ultra-small values for tiny details"
+    )
+    bpy.types.Scene.genos_lineart_edge_min = FloatProperty(
+        name="Lineart Edge Min",
+        default=0.01,
+        min=0.0,
+        max=1.0,
+        precision=6,
+        description="Lower threshold for generated lineart mask"
+    )
+    bpy.types.Scene.genos_lineart_edge_max = FloatProperty(
+        name="Lineart Edge Max",
+        default=0.15,
+        min=0.0,
+        max=1.0,
+        precision=6,
+        description="Upper threshold for generated lineart mask"
+    )
+    bpy.types.Scene.genos_lineart_gamma = FloatProperty(
+        name="Lineart Sharpness",
+        default=1.0,
+        min=0.1,
+        max=8.0,
+        precision=3,
+        description="Power curve for line sharpness; higher values create crisper lines"
+    )
+    bpy.types.Scene.genos_lineart_smooth = BoolProperty(
+        name="Smooth Sharp Bake",
+        default=True,
+        description="Uses smoothstep remapping before sharpness to keep bakes smooth but crisp"
+    )
+    bpy.types.Scene.genos_lineart_samples = IntProperty(
+        name="Lineart Samples",
+        default=12,
+        min=1,
+        max=64,
+        description="Bevel samples for curvature capture; higher values reduce noise"
+    )
 
     bpy.types.Material.genos_normal_map = image_prop("Normal Map")
     bpy.types.Material.genos_ilm_packed = image_prop("ILM Packed")
     bpy.types.Material.genos_detail_packed = image_prop("Detail Packed")
     bpy.types.Material.genos_sdf_map = image_prop("SDF Map")
+    bpy.types.Material.genos_displacement_map = image_prop("Displacement Map")
+    bpy.types.Material.genos_pattern_color_map = image_prop("Pattern Color Map")
+    bpy.types.Material.genos_pattern_roughness_map = image_prop("Pattern Roughness Map")
+    bpy.types.Material.genos_pattern_normal_map = image_prop("Pattern Normal Map")
 
 def unregister_scene_props():
     scene_props = [
         "genos_output_dir", "genos_texture_size", "genos_base_name", 
-        "genos_autotoggle_paint", "genos_export_mesh_copy", # FIXED HERE
+        "genos_autotoggle_paint", "genos_export_mesh_copy", "genos_hair_transparency", "genos_hair_highlight_strength", "genos_eye_sparkle_strength", "genos_2d_mouth", "genos_displacement_strength", "genos_bake_displacement",
+        "genos_lineart_preset", "genos_clothing_pattern_type", "genos_pattern_scale", "genos_pattern_strength", "genos_pattern_rotation", "genos_pattern_tint", "genos_pattern_cache_dir",
+        "genos_pattern_url_pantyhose", "genos_pattern_url_stripes", "genos_pattern_url_ripped", "genos_pattern_url_bodysuit", "genos_pattern_url_dots", "genos_pattern_url_cotton", "genos_pattern_url_leather",
+        "genos_pattern_last_download_report",
         "genos_paint_target", "genos_exp_suf_albedo", "genos_exp_suf_emission", "genos_exp_suf_ilm", 
-        "genos_exp_suf_detail", "genos_exp_suf_sdf", "genos_spec_mat_type", "genos_lineart_radius", "genos_create_shader_type"
+        "genos_exp_suf_detail", "genos_exp_suf_sdf", "genos_exp_suf_displacement", "genos_spec_mat_type", "genos_lineart_radius", "genos_lineart_edge_min", "genos_lineart_edge_max", "genos_lineart_gamma", "genos_lineart_smooth", "genos_lineart_samples", "genos_create_shader_type"
     ]
     for p in scene_props:
         if hasattr(bpy.types.Scene, p): delattr(bpy.types.Scene, p)
         
-    mat_props = ["genos_normal_map", "genos_ilm_packed", "genos_detail_packed", "genos_sdf_map"]
+    mat_props = ["genos_normal_map", "genos_ilm_packed", "genos_detail_packed", "genos_sdf_map", "genos_displacement_map", "genos_pattern_color_map", "genos_pattern_roughness_map", "genos_pattern_normal_map"]
     for p in mat_props:
         if hasattr(bpy.types.Material, p): delattr(bpy.types.Material, p)
 
@@ -2311,6 +3161,7 @@ class GENOS_OT_repair_textures(bpy.types.Operator):
         reset_img("Detail_Curve", (0.0, 0.0, 0.0, 1.0))
         reset_img("Detail_Accent", (0.0, 0.0, 0.0, 1.0))
         reset_img("Detail_Emission", (0.0, 0.0, 0.0, 1.0))
+        reset_img("Pattern Mask", (0.0, 0.0, 0.0, 1.0))
         
         self.report({'INFO'}, "Successfully restored all default texture data.")
         return {'FINISHED'}
@@ -2356,6 +3207,8 @@ class GENOS_OT_create_workspace(bpy.types.Operator):
             "detail_curve": make_image(f"{mat_base}_Detail_CurveSrc", size, size, alpha=True, colorspace=MASK_COLORSPACE, color=(0.0, 0.0, 0.0, 1.0)),
             "detail_accent": make_image(f"{mat_base}_Detail_AccentSrc", size, size, alpha=True, colorspace=MASK_COLORSPACE, color=(0.0, 0.0, 0.0, 1.0)),
             "detail_emission": make_image(f"{mat_base}_Detail_EmissionSrc", size, size, alpha=True, colorspace=MASK_COLORSPACE, color=(0.0, 0.0, 0.0, 1.0)),
+            "pattern_mask": make_image(f"{mat_base}_PatternMask", size, size, alpha=True, colorspace=MASK_COLORSPACE, color=(0.0, 0.0, 0.0, 1.0)),
+            "displacement_map": make_image(f"{mat_base}_Displacement", size, size, alpha=False, colorspace="Non-Color", color=(0.5, 0.5, 0.5, 1.0)),
         }
 
 
@@ -2389,7 +3242,8 @@ class GENOS_OT_regenerate_shader(bpy.types.Operator):
         if not obj or not obj.active_material: return {'CANCELLED'}
         mat = obj.active_material
 
-        if "is_anime_toon" not in mat:
+        is_baked = "is_anime_toon_baked" in mat
+        if "is_anime_toon" not in mat and not is_baked:
             self.report({'ERROR'}, "Active material is not an AnimeToon shader.")
             return {'CANCELLED'}
 
@@ -2402,32 +3256,45 @@ class GENOS_OT_regenerate_shader(bpy.types.Operator):
             node = mat.node_tree.nodes.get(node_name)
             return node.image if node else None
 
-        images = {
-            "basecolor": get_node_img("BaseColor"),
-            "emission_map": get_node_img("Emission Map"),
-            "normal_map": mat.genos_normal_map,
-            "ilm_shadow": get_node_img("ILM_Shadow"),
-            "ilm_emission": get_node_img("ILM_Emission"),
-            "ilm_spec": get_node_img("ILM_Spec"),
-            "ilm_rim": get_node_img("ILM_Rim"),
-            "detail_ao": get_node_img("Detail_AO"),
-            "detail_curve": get_node_img("Detail_Curve"),
-            "detail_accent": get_node_img("Detail_Accent"),
-            "detail_emission": get_node_img("Detail_Emission"),
-            "sdf_map": get_node_img("SDF Map"),
-        }
+        images_dict = {}
+        images_dict["basecolor"] = get_node_img("BaseColor")
+        images_dict["emission_map"] = get_node_img("Emission Map")
+        images_dict["normal_map"] = mat.genos_normal_map
+        images_dict["ilm_shadow"] = get_node_img("ILM_Shadow")
+        images_dict["ilm_emission"] = get_node_img("ILM_Emission")
+        images_dict["ilm_spec"] = get_node_img("ILM_Spec")
+        images_dict["ilm_rim"] = get_node_img("ILM_Rim")
+        images_dict["detail_ao"] = get_node_img("Detail_AO")
+        images_dict["detail_curve"] = get_node_img("Detail_Curve")
+        images_dict["detail_accent"] = get_node_img("Detail_Accent")
+        images_dict["detail_emission"] = get_node_img("Detail_Emission")
+        images_dict["pattern_mask"] = get_node_img("Pattern Mask")
+        images_dict["sdf_map"] = get_node_img("SDF Map")
+        images_dict["displacement_map"] = get_node_img("Displacement Map")
+        images_dict["pattern_color"] = getattr(mat, "genos_pattern_color_map", None)
+        images_dict["pattern_roughness"] = getattr(mat, "genos_pattern_roughness_map", None)
+        images_dict["pattern_normal"] = getattr(mat, "genos_pattern_normal_map", None)
+        
         if mat.get("genos_shader_type") == 'FACE':
-            images["sdf_map"] = get_node_img("SDF Map")
-
+            images_dict["sdf_map"] = get_node_img("SDF Map")
 
         mask_keys = {
             "ilm_shadow", "ilm_emission", "ilm_spec", "ilm_rim",
-            "detail_ao", "detail_curve", "detail_accent", "detail_emission"
+            "detail_ao", "detail_curve", "detail_accent", "detail_emission", "pattern_mask"
         }
+        if "displacement_map" in images_dict and not images_dict["displacement_map"]:
+            if getattr(mat, "genos_displacement_map", None):
+                images_dict["displacement_map"] = mat.genos_displacement_map
+
         # SDF map should be Non-Color when present
         mask_keys.add("sdf_map")
-        for key, img in images.items():
+        mask_keys.add("displacement_map")
+        for key, img in images_dict.items():
             if img:
+                # IMPORTANT: ensure images are not garbage collected during nodes.clear()
+                try: img.use_fake_user = True
+                except: pass
+                
                 if key == "normal_map" or key in mask_keys:
                     try: img.colorspace_settings.name = 'Non-Color'
                     except: pass
@@ -2437,11 +3304,34 @@ class GENOS_OT_regenerate_shader(bpy.types.Operator):
 
         # Prefer any already-exported packed ILM/Detail maps when regenerating
         try:
-            try_load_packed_maps_into_images(mat, images)
+            try_load_packed_maps_into_images(mat, images_dict)
         except Exception:
             pass
 
-        build_preview_material(mat, images)
+        if is_baked:
+            build_baked_material(
+                mat,
+                images_dict.get("basecolor"),
+                images_dict.get("emission_map"),
+                images_dict.get("normal_map"),
+                images_dict.get("ilm_shadow"),
+                images_dict.get("detail_ao"),
+                images_dict.get("sdf_map"),
+                images_dict.get("displacement_map"),
+                images_dict.get("pattern_mask"),
+                images_dict.get("pattern_color")
+            )
+        else:
+            build_preview_material(mat, images_dict)
+            
+        # Re-assign custom property image pointers that might have detached during nodes.clear()
+        if getattr(mat, "genos_pattern_color_map", None) is None and images_dict.get("pattern_color"):
+            mat.genos_pattern_color_map = images_dict["pattern_color"]
+        if getattr(mat, "genos_pattern_roughness_map", None) is None and images_dict.get("pattern_roughness"):
+            mat.genos_pattern_roughness_map = images_dict["pattern_roughness"]
+        if getattr(mat, "genos_pattern_normal_map", None) is None and images_dict.get("pattern_normal"):
+            mat.genos_pattern_normal_map = images_dict["pattern_normal"]
+            
         self.report({'INFO'}, f"Failsafe Cleaned & Regenerated Node Tree for {mat.name}")
         return {'FINISHED'}
 
@@ -2452,7 +3342,6 @@ class GENOS_OT_bake_specular(bpy.types.Operator):
     def execute(self, context):
         obj = context.active_object
         if not obj or obj.type != 'MESH': return {'CANCELLED'}
-        # Preview appearance uses Eevee-style compositing and does not require a UV bake.
 
         mat = obj.active_material
         if not mat: return {'CANCELLED'}
@@ -2476,24 +3365,54 @@ class GENOS_OT_bake_specular(bpy.types.Operator):
 
         if mat_type == 'HAIR':
             tex_coord = temp_mat.node_tree.nodes.new("ShaderNodeTexCoord")
+            
+            noise = temp_mat.node_tree.nodes.new("ShaderNodeTexNoise")
+            noise.inputs["Scale"].default_value = 10.0
+            noise.inputs["Detail"].default_value = 2.0
+            
+            mix_vec = temp_mat.node_tree.nodes.new("ShaderNodeMix")
+            mix_vec.data_type = 'VECTOR'
+            mix_vec.blend_type = 'LINEAR_LIGHT'
+            mix_vec.inputs["Factor"].default_value = 0.05
+            
             mapping = temp_mat.node_tree.nodes.new("ShaderNodeMapping")
-            mapping.inputs["Scale"].default_value = (1.0, 1.0, 0.15)
+            mapping.inputs["Scale"].default_value = (1.0, 1.0, 0.2)
+            
+            temp_mat.node_tree.links.new(tex_coord.outputs["Generated"], mix_vec.inputs["A"])
+            temp_mat.node_tree.links.new(noise.outputs["Color"], mix_vec.inputs["B"])
+            temp_mat.node_tree.links.new(mix_vec.outputs["Result"], mapping.inputs["Vector"])
+            
             wave = temp_mat.node_tree.nodes.new("ShaderNodeTexWave")
             wave.wave_type = 'BANDS'
             wave.bands_direction = 'Z'
+            wave.wave_profile = 'SIN'
+            temp_mat.node_tree.links.new(mapping.outputs["Vector"], wave.inputs["Vector"])
+            
             ramp = temp_mat.node_tree.nodes.new("ShaderNodeValToRGB")
             ramp.color_ramp.elements[0].position = 0.45; ramp.color_ramp.elements[0].color = (0,0,0,1)
             ramp.color_ramp.elements[1].position = 0.55; ramp.color_ramp.elements[1].color = (1,1,1,1)
-            fresnel = temp_mat.node_tree.nodes.new("ShaderNodeFresnel")
-            fresnel.inputs["IOR"].default_value = 1.3
+            temp_mat.node_tree.links.new(wave.outputs["Color"], ramp.inputs["Fac"])
+            
+            layer_weight = temp_mat.node_tree.nodes.new("ShaderNodeLayerWeight")
+            layer_weight.inputs["Blend"].default_value = 0.3
+            
             mult = temp_mat.node_tree.nodes.new("ShaderNodeMath")
             mult.operation = 'MULTIPLY'
-            temp_mat.node_tree.links.new(tex_coord.outputs["Generated"], mapping.inputs[0])
-            temp_mat.node_tree.links.new(mapping.outputs[0], wave.inputs[0])
-            temp_mat.node_tree.links.new(wave.outputs["Color"], ramp.inputs[0])
-            temp_mat.node_tree.links.new(ramp.outputs[0], mult.inputs[0])
-            temp_mat.node_tree.links.new(fresnel.outputs[0], mult.inputs[1])
-            temp_mat.node_tree.links.new(mult.outputs[0], emit.inputs[0])
+            temp_mat.node_tree.links.new(ramp.outputs["Color"], mult.inputs[0])
+            temp_mat.node_tree.links.new(layer_weight.outputs["Facing"], mult.inputs[1])
+            
+            boost = temp_mat.node_tree.nodes.new("ShaderNodeMath")
+            boost.operation = 'MULTIPLY'
+            boost.inputs[1].default_value = 2.5
+            temp_mat.node_tree.links.new(mult.outputs["Value"], boost.inputs[0])
+
+            clamp = temp_mat.node_tree.nodes.new("ShaderNodeMath")
+            clamp.operation = 'MINIMUM'
+            clamp.inputs[1].default_value = 1.0
+            temp_mat.node_tree.links.new(boost.outputs["Value"], clamp.inputs[0])
+            
+            temp_mat.node_tree.links.new(clamp.outputs["Value"], emit.inputs[0])
+
         elif mat_type == 'METAL':
             noise = temp_mat.node_tree.nodes.new("ShaderNodeTexNoise")
             noise.inputs["Scale"].default_value = 15.0
@@ -2630,6 +3549,276 @@ class GENOS_OT_bake_ao(bpy.types.Operator):
 
         self.report({'ERROR'}, "AO bake failed. Check UVs and the active image target.")
         return {'CANCELLED'}
+    
+class GENOS_OT_bake_sdf(bpy.types.Operator):
+    bl_idname = "genos.bake_sdf"
+    bl_label = "Auto-Bake SDF Map"
+    bl_description = "Bakes a baseline shadow threshold gradient based on the forward (-Y) normals"
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH': return {'CANCELLED'}
+
+        mat = obj.active_material
+        if not mat: return {'CANCELLED'}
+
+        sdf_node = mat.node_tree.nodes.get("SDF Map")
+        if not sdf_node or not sdf_node.image:
+            self.report({'ERROR'}, "No SDF Map found. Ensure this is a FACE shader.")
+            return {'CANCELLED'}
+
+        orig_mode = obj.mode
+        if orig_mode != 'OBJECT':
+            try: bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception: pass
+
+        temp_mat = bpy.data.materials.new("TEMP_BAKE_SDF")
+        temp_mat.use_nodes = True
+        nodes = temp_mat.node_tree.nodes
+        links = temp_mat.node_tree.links
+        nodes.clear()
+
+        out = nodes.new("ShaderNodeOutputMaterial")
+        emit = nodes.new("ShaderNodeEmission")
+
+        # Capture Mesh Normals
+        geom = nodes.new("ShaderNodeNewGeometry")
+        
+        # Calculate Dot Product with Forward Axis (-Y)
+        fwd_dot = nodes.new("ShaderNodeVectorMath")
+        fwd_dot.operation = 'DOT_PRODUCT'
+        fwd_dot.inputs[1].default_value = (0.0, -1.0, 0.0) 
+        links.new(geom.outputs["Normal"], fwd_dot.inputs[0])
+
+        # Map Normal range [-1, 1] to Color range [0, 1]
+        map_range = nodes.new("ShaderNodeMapRange")
+        map_range.inputs["From Min"].default_value = -1.0
+        map_range.inputs["From Max"].default_value = 1.0
+        links.new(fwd_dot.outputs["Value"], map_range.inputs["Value"])
+        
+        # Add a slight power curve for better facial shadow falloff
+        power = nodes.new("ShaderNodeMath")
+        power.operation = 'POWER'
+        power.inputs[1].default_value = 1.2
+        links.new(map_range.outputs["Result"], power.inputs[0])
+
+        links.new(power.outputs["Value"], emit.inputs[0])
+        links.new(emit.outputs[0], out.inputs[0])
+
+        # Setup Target Image Node
+        img_node = nodes.new("ShaderNodeTexImage")
+        img_node.name = "SDF Map"
+        img_node.label = "SDF Map"
+        img_node.image = sdf_node.image
+        nodes.active = img_node
+        img_node.select = True
+
+        orig_mats = [s.material for s in obj.material_slots]
+        orig_active_index = obj.active_material_index
+        success = False
+        try:
+            for s in obj.material_slots:
+                s.material = temp_mat
+            
+            # Execute the internal bake pipeline (Emission mode)
+            success = execute_bake(context, temp_mat, "SDF Map", is_ao=False)
+        finally:
+            # Restore original materials
+            for i, s in enumerate(obj.material_slots):
+                if i < len(orig_mats):
+                    s.material = orig_mats[i]
+            obj.active_material_index = orig_active_index
+            bpy.data.materials.remove(temp_mat)
+            if orig_mode != 'OBJECT':
+                try: bpy.ops.object.mode_set(mode=orig_mode)
+                except Exception: pass
+
+        if success:
+            self.report({'INFO'}, "Successfully baked baseline SDF Map.")
+            return {'FINISHED'}
+
+        self.report({'ERROR'}, "SDF bake failed. Check UVs and Active Object.")
+        return {'CANCELLED'}
+
+class GENOS_OT_bake_normal(bpy.types.Operator):
+    bl_idname = "genos.bake_normal"
+    bl_label = "Auto-Bake Normal Map"
+    bl_description = "Bake the normal details into the Normal Map image"
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            return {'CANCELLED'}
+
+        mat = obj.active_material
+        if not mat or not mat.use_nodes:
+            return {'CANCELLED'}
+
+        normal_img = mat.genos_normal_map
+        if not normal_img:
+            base = material_base_name(mat)
+            normal_img = make_image(f"{base}_Normal", scene_texture_size(), scene_texture_size(), alpha=False, colorspace="Non-Color", color=(0.5, 0.5, 1.0, 1.0))
+            try: mat.genos_normal_map = normal_img
+            except: pass
+
+        orig_mode = obj.mode
+        if orig_mode != 'OBJECT':
+            try: bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception: pass
+
+        temp_mat = bpy.data.materials.new("TEMP_BAKE_NORMAL")
+        temp_mat.use_nodes = True
+        nodes = temp_mat.node_tree.nodes
+        links = temp_mat.node_tree.links
+        nodes.clear()
+
+        out = nodes.new("ShaderNodeOutputMaterial")
+        
+        # Check if the original material has a bump/normal mapping setup
+        orig_bump = mat.node_tree.nodes.get("Bump")
+        orig_normal = mat.node_tree.nodes.get("Normal Map")
+        
+        # If there's an existing bump/normal setup we want to bake that
+        emit = nodes.new("ShaderNodeEmission")
+        
+        # Instead of directly emitting normal, we bake from a separate pass when possible
+        # But for emission bake approach (like displacement):
+        from_node = nodes.new("ShaderNodeNewGeometry")
+        
+        # We really want to bake normals properly using Cycles normal bake, not emission bake
+        # For now, let's keep the operator structure but use the geometry node as fallback
+        links.new(from_node.outputs["Normal"], emit.inputs[0])
+        links.new(emit.outputs[0], out.inputs[0])
+
+        img_node = nodes.new("ShaderNodeTexImage")
+        img_node.name = "Normal Map"
+        img_node.label = "Normal Map"
+        img_node.image = normal_img
+        nodes.active = img_node
+        img_node.select = True
+
+        orig_mats = [s.material for s in obj.material_slots]
+        orig_active_index = obj.active_material_index
+        success = False
+        
+        # Try true normal bake on the original material first if we can, else fallback
+        bake_state = capture_bake_state(context.scene)
+        try:
+            configure_internal_bake(context.scene, 128)
+            
+            # Setup for normal bake on original material
+            context.view_layer.objects.active = obj
+            obj.select_set(True)
+            
+            # Temporarily add our target node to the real material to bake to it
+            target_node = mat.node_tree.nodes.new("ShaderNodeTexImage")
+            target_node.image = normal_img
+            mat.node_tree.nodes.active = target_node
+            target_node.select = True
+            
+            fill_image_solid(normal_img, (0.5, 0.5, 1.0, 1.0))
+            
+            context.view_layer.update()
+            
+            # Execute normal bake
+            if bake_active_image('NORMAL', margin=16, use_clear=False):
+                success = True
+                normal_img.update()
+                try: normal_img.pack()
+                except: pass
+                
+            # Cleanup target node
+            mat.node_tree.nodes.remove(target_node)
+            
+        finally:
+            restore_bake_state(context.scene, bake_state)
+            if orig_mode != 'OBJECT':
+                try: bpy.ops.object.mode_set(mode=orig_mode)
+                except Exception: pass
+
+        if success:
+            self.report({'INFO'}, "Successfully baked Normal Map.")
+            return {'FINISHED'}
+
+        self.report({'ERROR'}, "Normal bake failed. Check UVs and active object.")
+        return {'CANCELLED'}
+
+class GENOS_OT_bake_displacement(bpy.types.Operator):
+    bl_idname = "genos.bake_displacement"
+    bl_label = "Auto-Bake Displacement Map"
+    bl_description = "Bake the displacement height into the Displacement Map image"
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            return {'CANCELLED'}
+
+        mat = obj.active_material
+        if not mat or not mat.use_nodes:
+            return {'CANCELLED'}
+
+        disp_img = mat.genos_displacement_map
+        if not disp_img:
+            base = material_base_name(mat)
+            disp_img = make_image(f"{base}_Displacement", scene_texture_size(), scene_texture_size(), alpha=False, colorspace="Non-Color", color=(0.5, 0.5, 0.5, 1.0))
+            try: mat.genos_displacement_map = disp_img
+            except: pass
+
+        orig_mode = obj.mode
+        if orig_mode != 'OBJECT':
+            try: bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception: pass
+
+        temp_mat = bpy.data.materials.new("TEMP_BAKE_DISP")
+        temp_mat.use_nodes = True
+        nodes = temp_mat.node_tree.nodes
+        links = temp_mat.node_tree.links
+        nodes.clear()
+
+        out = nodes.new("ShaderNodeOutputMaterial")
+        emit = nodes.new("ShaderNodeEmission")
+        links.new(emit.outputs[0], out.inputs[0])
+
+        tex = nodes.new("ShaderNodeTexImage")
+        tex.image = disp_img
+        tex.interpolation = 'Linear'
+
+        scale = nodes.new("ShaderNodeMath")
+        scale.operation = 'MULTIPLY'
+        scale.inputs[1].default_value = getattr(context.scene, "genos_displacement_strength", 0.1)
+        links.new(tex.outputs[0], scale.inputs[0])
+        links.new(scale.outputs[0], emit.inputs[0])
+
+        img_node = nodes.new("ShaderNodeTexImage")
+        img_node.name = "Displacement Map"
+        img_node.label = "Displacement Map"
+        img_node.image = disp_img
+        nodes.active = img_node
+        img_node.select = True
+
+        orig_mats = [s.material for s in obj.material_slots]
+        orig_active_index = obj.active_material_index
+        success = False
+        try:
+            for s in obj.material_slots:
+                s.material = temp_mat
+            success = execute_bake(context, temp_mat, "Displacement Map", is_ao=False, colorspace="Non-Color", prefill_color=(0.5, 0.5, 0.5, 1.0), pack_after=True)
+        finally:
+            for i, s in enumerate(obj.material_slots):
+                if i < len(orig_mats):
+                    s.material = orig_mats[i]
+            obj.active_material_index = orig_active_index
+            bpy.data.materials.remove(temp_mat)
+            if orig_mode != 'OBJECT':
+                try: bpy.ops.object.mode_set(mode=orig_mode)
+                except Exception: pass
+
+        if success:
+            self.report({'INFO'}, "Successfully baked Displacement Map.")
+            return {'FINISHED'}
+
+        self.report({'ERROR'}, "Displacement bake failed. Check UVs and active object.")
+        return {'CANCELLED'}
 
 class GENOS_OT_bake_curvature(bpy.types.Operator):
     bl_idname = "genos.bake_curvature"
@@ -2639,6 +3828,15 @@ class GENOS_OT_bake_curvature(bpy.types.Operator):
         obj = context.active_object
         if not obj or obj.type != 'MESH': return {'CANCELLED'}
         # Preview appearance uses Eevee-style compositing and does not require a UV bake.
+
+        scene = context.scene
+        edge_min = float(getattr(scene, "genos_lineart_edge_min", 0.01))
+        edge_max = float(getattr(scene, "genos_lineart_edge_max", 0.15))
+        if edge_max <= edge_min:
+            edge_max = edge_min + 0.0001
+        line_gamma = float(getattr(scene, "genos_lineart_gamma", 1.0))
+        line_smooth = bool(getattr(scene, "genos_lineart_smooth", True))
+        line_samples = int(getattr(scene, "genos_lineart_samples", 12))
 
         mat = obj.active_material
         if not mat: return {'CANCELLED'}
@@ -2660,7 +3858,7 @@ class GENOS_OT_bake_curvature(bpy.types.Operator):
         geom = temp_mat.node_tree.nodes.new("ShaderNodeNewGeometry")
         bevel = temp_mat.node_tree.nodes.new("ShaderNodeBevel")
         bevel.inputs["Radius"].default_value = context.scene.genos_lineart_radius
-        bevel.samples = 12
+        bevel.samples = line_samples
 
         dist = temp_mat.node_tree.nodes.new("ShaderNodeVectorMath")
         dist.operation = 'DISTANCE'
@@ -2677,14 +3875,34 @@ class GENOS_OT_bake_curvature(bpy.types.Operator):
         else:
             temp_mat.node_tree.links.new(geom.outputs["Normal"], dist.inputs[0])
 
-        ramp = temp_mat.node_tree.nodes.new("ShaderNodeValToRGB")
-        ramp.color_ramp.elements[0].position = 0.01
-        ramp.color_ramp.elements[0].color = (0,0,0,1)
-        ramp.color_ramp.elements[1].position = 0.15
-        ramp.color_ramp.elements[1].color = (1,1,1,1)
+        if line_smooth:
+            edge_map = temp_mat.node_tree.nodes.new("ShaderNodeMapRange")
+            edge_map.interpolation_type = 'SMOOTHSTEP'
+            edge_map.inputs["From Min"].default_value = edge_min
+            edge_map.inputs["From Max"].default_value = edge_max
+            edge_map.inputs["To Min"].default_value = 0.0
+            edge_map.inputs["To Max"].default_value = 1.0
+            temp_mat.node_tree.links.new(dist.outputs["Value"], edge_map.inputs["Value"])
 
-        temp_mat.node_tree.links.new(dist.outputs["Value"], ramp.inputs[0])
-        temp_mat.node_tree.links.new(ramp.outputs[0], emit.inputs[0])
+            gamma = temp_mat.node_tree.nodes.new("ShaderNodeMath")
+            gamma.operation = 'POWER'
+            gamma.inputs[1].default_value = line_gamma
+            temp_mat.node_tree.links.new(edge_map.outputs["Result"], gamma.inputs[0])
+            temp_mat.node_tree.links.new(gamma.outputs["Value"], emit.inputs[0])
+        else:
+            ramp = temp_mat.node_tree.nodes.new("ShaderNodeValToRGB")
+            ramp.color_ramp.elements[0].position = edge_min
+            ramp.color_ramp.elements[0].color = (0,0,0,1)
+            ramp.color_ramp.elements[1].position = edge_max
+            ramp.color_ramp.elements[1].color = (1,1,1,1)
+
+            temp_mat.node_tree.links.new(dist.outputs["Value"], ramp.inputs[0])
+
+            gamma = temp_mat.node_tree.nodes.new("ShaderNodeMath")
+            gamma.operation = 'POWER'
+            gamma.inputs[1].default_value = line_gamma
+            temp_mat.node_tree.links.new(ramp.outputs[0], gamma.inputs[0])
+            temp_mat.node_tree.links.new(gamma.outputs["Value"], emit.inputs[0])
         temp_mat.node_tree.links.new(emit.outputs[0], out.inputs[0])
 
         img_node = temp_mat.node_tree.nodes.new("ShaderNodeTexImage")
@@ -2717,6 +3935,503 @@ class GENOS_OT_bake_curvature(bpy.types.Operator):
         self.report({'ERROR'}, "Lineart bake failed. Check UVs and the active image target.")
         return {'CANCELLED'}
 
+def _connect_mask_to_emission(nodes, links, emit_node, mask_socket):
+    if mask_socket is None:
+        return
+    if getattr(mask_socket, "type", "") in {'VALUE', 'INT'}:
+        comb = nodes.new("ShaderNodeCombineColor")
+        comb.location = (300, 0)
+        links.new(mask_socket, comb.inputs[0])
+        links.new(mask_socket, comb.inputs[1])
+        links.new(mask_socket, comb.inputs[2])
+        links.new(comb.outputs[0], emit_node.inputs[0])
+    else:
+        links.new(mask_socket, emit_node.inputs[0])
+
+def _bake_generated_mask(context, obj, target_img, target_node_name, graph_builder, *, colorspace=MASK_COLORSPACE, prefill=(0.0, 0.0, 0.0, 1.0)):
+    if target_img is None:
+        return False
+
+    temp_mat = bpy.data.materials.new(f"TEMP_BAKE_{target_node_name}")
+    temp_mat.use_nodes = True
+    nodes = temp_mat.node_tree.nodes
+    links = temp_mat.node_tree.links
+    nodes.clear()
+
+    out = nodes.new("ShaderNodeOutputMaterial")
+    emit = nodes.new("ShaderNodeEmission")
+    links.new(emit.outputs[0], out.inputs[0])
+
+    try:
+        mask_socket = graph_builder(nodes, links, context.scene)
+    except Exception:
+        mask_socket = None
+    _connect_mask_to_emission(nodes, links, emit, mask_socket)
+
+    img_node = nodes.new("ShaderNodeTexImage")
+    img_node.name = target_node_name
+    img_node.label = target_node_name
+    img_node.image = target_img
+    nodes.active = img_node
+    img_node.select = True
+
+    orig_mode = obj.mode
+    if orig_mode != 'OBJECT':
+        try:
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            pass
+
+    orig_mats = [slot.material for slot in obj.material_slots]
+    orig_active_index = obj.active_material_index
+    if not obj.material_slots:
+        bpy.ops.object.material_slot_add()
+        orig_mats = [None]
+
+    for slot in obj.material_slots:
+        slot.material = temp_mat
+
+    success = False
+    try:
+        success = execute_bake(
+            context,
+            temp_mat,
+            target_node_name,
+            is_ao=False,
+            colorspace=colorspace,
+            prefill_color=prefill,
+            pack_after=True,
+        )
+    finally:
+        for i, slot in enumerate(obj.material_slots):
+            if i < len(orig_mats):
+                slot.material = orig_mats[i]
+        obj.active_material_index = orig_active_index
+        bpy.data.materials.remove(temp_mat)
+        if orig_mode != 'OBJECT':
+            try:
+                bpy.ops.object.mode_set(mode=orig_mode)
+            except Exception:
+                pass
+    return success
+
+def _hair_spec_graph(nodes, links, scene):
+    uv = nodes.new("ShaderNodeTexCoord")
+    uv.location = (-1300, 200)
+
+    warp_noise = nodes.new("ShaderNodeTexNoise")
+    warp_noise.location = (-1300, -50)
+    warp_noise.inputs["Scale"].default_value = 12.0
+    warp_noise.inputs["Detail"].default_value = 5.0
+    warp_noise.inputs["Roughness"].default_value = 0.5
+
+    warp_mul = nodes.new("ShaderNodeVectorMath")
+    warp_mul.location = (-1050, -50)
+    warp_mul.operation = 'MULTIPLY'
+    warp_mul.inputs[1].default_value = (0.045, 0.02, 0.0)
+    links.new(warp_noise.outputs["Color"], warp_mul.inputs[0])
+
+    warp_add = nodes.new("ShaderNodeVectorMath")
+    warp_add.location = (-850, 150)
+    warp_add.operation = 'ADD'
+    links.new(uv.outputs["UV"], warp_add.inputs[0])
+    links.new(warp_mul.outputs[0], warp_add.inputs[1])
+
+    wave = nodes.new("ShaderNodeTexWave")
+    wave.location = (-650, 150)
+    wave.wave_type = 'BANDS'
+    wave.bands_direction = 'Y'
+    wave.wave_profile = 'SIN'
+    wave.inputs["Scale"].default_value = 28.0
+    wave.inputs["Distortion"].default_value = 2.2
+    links.new(warp_add.outputs[0], wave.inputs["Vector"])
+
+    ramp = nodes.new("ShaderNodeValToRGB")
+    ramp.location = (-450, 150)
+    ramp.color_ramp.elements[0].position = 0.47
+    ramp.color_ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
+    ramp.color_ramp.elements[1].position = 0.535
+    ramp.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
+    links.new(wave.outputs["Color"], ramp.inputs["Fac"])
+
+    facing = nodes.new("ShaderNodeLayerWeight")
+    facing.location = (-650, -100)
+    facing.inputs["Blend"].default_value = 0.24
+
+    facing_gain = nodes.new("ShaderNodeMath")
+    facing_gain.location = (-450, -100)
+    facing_gain.operation = 'MULTIPLY'
+    facing_gain.inputs[1].default_value = 0.55
+    links.new(facing.outputs["Facing"], facing_gain.inputs[0])
+
+    mask_max = nodes.new("ShaderNodeMath")
+    mask_max.location = (-200, 50)
+    mask_max.operation = 'MAXIMUM'
+    links.new(ramp.outputs["Color"], mask_max.inputs[0])
+    links.new(facing_gain.outputs[0], mask_max.inputs[1])
+
+    strength = nodes.new("ShaderNodeMath")
+    strength.location = (20, 50)
+    strength.operation = 'MULTIPLY'
+    strength.inputs[1].default_value = max(0.0, getattr(scene, "genos_hair_highlight_strength", 1.0))
+    links.new(mask_max.outputs[0], strength.inputs[0])
+
+    clamp = nodes.new("ShaderNodeClamp")
+    clamp.location = (220, 50)
+    links.new(strength.outputs[0], clamp.inputs["Value"])
+    return clamp.outputs["Result"]
+
+def _hair_rim_graph(nodes, links, scene):
+    facing = nodes.new("ShaderNodeLayerWeight")
+    facing.location = (-500, 0)
+    facing.inputs["Blend"].default_value = 0.12
+
+    power = nodes.new("ShaderNodeMath")
+    power.location = (-250, 0)
+    power.operation = 'POWER'
+    power.inputs[1].default_value = 2.8
+    links.new(facing.outputs["Facing"], power.inputs[0])
+
+    gain = nodes.new("ShaderNodeMath")
+    gain.location = (0, 0)
+    gain.operation = 'MULTIPLY'
+    gain.inputs[1].default_value = max(0.0, getattr(scene, "genos_hair_highlight_strength", 1.0)) * 0.8
+    links.new(power.outputs[0], gain.inputs[0])
+    return gain.outputs[0]
+
+def _hair_accent_graph(nodes, links, scene):
+    uv = nodes.new("ShaderNodeTexCoord")
+    uv.location = (-900, 0)
+
+    wave = nodes.new("ShaderNodeTexWave")
+    wave.location = (-650, 0)
+    wave.wave_type = 'BANDS'
+    wave.bands_direction = 'Y'
+    wave.inputs["Scale"].default_value = 11.0
+    wave.inputs["Distortion"].default_value = 0.8
+    links.new(uv.outputs["UV"], wave.inputs["Vector"])
+
+    ramp = nodes.new("ShaderNodeValToRGB")
+    ramp.location = (-420, 0)
+    ramp.color_ramp.elements[0].position = 0.35
+    ramp.color_ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
+    ramp.color_ramp.elements[1].position = 0.78
+    ramp.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
+    links.new(wave.outputs["Color"], ramp.inputs["Fac"])
+
+    gain = nodes.new("ShaderNodeMath")
+    gain.location = (-180, 0)
+    gain.operation = 'MULTIPLY'
+    gain.inputs[1].default_value = max(0.0, getattr(scene, "genos_hair_highlight_strength", 1.0)) * 0.6
+    links.new(ramp.outputs["Color"], gain.inputs[0])
+    return gain.outputs[0]
+
+def _eye_sparkle_graph(nodes, links, scene):
+    uv = nodes.new("ShaderNodeTexCoord")
+    uv.location = (-900, 0)
+
+    voro = nodes.new("ShaderNodeTexVoronoi")
+    voro.location = (-650, 0)
+    voro.feature = 'F1'
+    voro.inputs["Scale"].default_value = 95.0
+    voro.inputs["Randomness"].default_value = 0.95
+    links.new(uv.outputs["UV"], voro.inputs["Vector"])
+
+    mapr = nodes.new("ShaderNodeMapRange")
+    mapr.location = (-420, 0)
+    mapr.interpolation_type = 'SMOOTHSTEP'
+    mapr.inputs["From Min"].default_value = 0.0
+    mapr.inputs["From Max"].default_value = 0.035
+    mapr.inputs["To Min"].default_value = 1.0
+    mapr.inputs["To Max"].default_value = 0.0
+    links.new(voro.outputs["Distance"], mapr.inputs["Value"])
+
+    gain = nodes.new("ShaderNodeMath")
+    gain.location = (-180, 0)
+    gain.operation = 'MULTIPLY'
+    gain.inputs[1].default_value = max(0.0, getattr(scene, "genos_eye_sparkle_strength", 1.0))
+    links.new(mapr.outputs["Result"], gain.inputs[0])
+    return gain.outputs[0]
+
+def _eye_ring_graph(nodes, links, scene):
+    uv = nodes.new("ShaderNodeTexCoord")
+    uv.location = (-1200, 100)
+
+    sep = nodes.new("ShaderNodeSeparateXYZ")
+    sep.location = (-1000, 100)
+    links.new(uv.outputs["UV"], sep.inputs[0])
+
+    off_x = nodes.new("ShaderNodeMath")
+    off_x.location = (-820, 180)
+    off_x.operation = 'SUBTRACT'
+    links.new(sep.outputs["X"], off_x.inputs[0])
+    off_x.inputs[1].default_value = 0.5
+
+    off_y = nodes.new("ShaderNodeMath")
+    off_y.location = (-820, 20)
+    off_y.operation = 'SUBTRACT'
+    links.new(sep.outputs["Y"], off_y.inputs[0])
+    off_y.inputs[1].default_value = 0.5
+
+    vec = nodes.new("ShaderNodeCombineXYZ")
+    vec.location = (-620, 100)
+    links.new(off_x.outputs[0], vec.inputs["X"])
+    links.new(off_y.outputs[0], vec.inputs["Y"])
+
+    length = nodes.new("ShaderNodeVectorMath")
+    length.location = (-420, 100)
+    length.operation = 'LENGTH'
+    links.new(vec.outputs[0], length.inputs[0])
+
+    outer = nodes.new("ShaderNodeMapRange")
+    outer.location = (-200, 180)
+    outer.interpolation_type = 'SMOOTHSTEP'
+    outer.inputs["From Min"].default_value = 0.18
+    outer.inputs["From Max"].default_value = 0.39
+    outer.inputs["To Min"].default_value = 1.0
+    outer.inputs["To Max"].default_value = 0.0
+    links.new(length.outputs["Value"], outer.inputs["Value"])
+
+    inner = nodes.new("ShaderNodeMapRange")
+    inner.location = (-200, 20)
+    inner.interpolation_type = 'SMOOTHSTEP'
+    inner.inputs["From Min"].default_value = 0.10
+    inner.inputs["From Max"].default_value = 0.22
+    inner.inputs["To Min"].default_value = 0.0
+    inner.inputs["To Max"].default_value = 1.0
+    links.new(length.outputs["Value"], inner.inputs["Value"])
+
+    ring = nodes.new("ShaderNodeMath")
+    ring.location = (20, 100)
+    ring.operation = 'MULTIPLY'
+    links.new(outer.outputs["Result"], ring.inputs[0])
+    links.new(inner.outputs["Result"], ring.inputs[1])
+
+    gain = nodes.new("ShaderNodeMath")
+    gain.location = (240, 100)
+    gain.operation = 'MULTIPLY'
+    gain.inputs[1].default_value = max(0.0, getattr(scene, "genos_eye_sparkle_strength", 1.0)) * 0.75
+    links.new(ring.outputs[0], gain.inputs[0])
+    return gain.outputs[0]
+
+def _eye_spec_graph(nodes, links, scene):
+    sparkle = _eye_sparkle_graph(nodes, links, scene)
+    ring = _eye_ring_graph(nodes, links, scene)
+    blend = nodes.new("ShaderNodeMath")
+    blend.location = (520, 40)
+    blend.operation = 'MAXIMUM'
+    links.new(sparkle, blend.inputs[0])
+    links.new(ring, blend.inputs[1])
+    return blend.outputs[0]
+
+def _eye_emission_detail_graph(nodes, links, scene):
+    sparkle = _eye_sparkle_graph(nodes, links, scene)
+    soft = nodes.new("ShaderNodeMath")
+    soft.location = (80, 0)
+    soft.operation = 'MULTIPLY'
+    soft.inputs[1].default_value = 0.6
+    links.new(sparkle, soft.inputs[0])
+    return soft.outputs[0]
+
+class GENOS_OT_bake_anime_fx(bpy.types.Operator):
+    bl_idname = "genos.bake_anime_fx"
+    bl_label = "Auto-Bake Anime Hair/Eye FX"
+    bl_description = "Bake procedural anime highlights for HAIR or anime eye sparkle/ring masks for non-HAIR materials into ILM and Detail source maps"
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            return {'CANCELLED'}
+
+        mat = obj.active_material
+        if not mat or not mat.use_nodes or "is_anime_toon" not in mat:
+            return {'CANCELLED'}
+
+        shader_type = mat.get("genos_shader_type", "DEFAULT")
+        if shader_type == 'HAIR':
+            bake_plan = [
+                ("ILM_Spec", _hair_spec_graph, (0.0, 0.0, 0.0, 1.0), "ilm"),
+                ("ILM_Rim", _hair_rim_graph, (0.0, 0.0, 0.0, 1.0), "ilm"),
+                ("Detail_Accent", _hair_accent_graph, (0.0, 0.0, 0.0, 1.0), "detail"),
+            ]
+        else:
+            bake_plan = [
+                ("ILM_Spec", _eye_spec_graph, (0.0, 0.0, 0.0, 1.0), "ilm"),
+                ("ILM_Emission", _eye_sparkle_graph, (0.0, 0.0, 0.0, 1.0), "ilm"),
+                ("Detail_Accent", _eye_ring_graph, (0.0, 0.0, 0.0, 1.0), "detail"),
+                ("Detail_Emission", _eye_emission_detail_graph, (0.0, 0.0, 0.0, 1.0), "detail"),
+            ]
+
+        baked = 0
+        ilm_touched = False
+        detail_touched = False
+
+        for node_name, builder, prefill, pack_group in bake_plan:
+            node = mat.node_tree.nodes.get(node_name)
+            target_img = node.image if node and hasattr(node, "image") else None
+            if target_img is None:
+                continue
+            set_image_colorspace(target_img, MASK_COLORSPACE)
+            if _bake_generated_mask(context, obj, target_img, node_name, builder, colorspace=MASK_COLORSPACE, prefill=prefill):
+                baked += 1
+                if pack_group == "ilm":
+                    ilm_touched = True
+                elif pack_group == "detail":
+                    detail_touched = True
+
+        if baked == 0:
+            self.report({'ERROR'}, "Anime FX bake failed or no target maps were found on this material.")
+            return {'CANCELLED'}
+
+        if ilm_touched:
+            pack_material_ilm(mat)
+        if detail_touched:
+            pack_material_detail(mat)
+
+        if shader_type == 'HAIR':
+            self.report({'INFO'}, f"Baked {baked} anime hair FX channels and repacked maps.")
+        else:
+            self.report({'INFO'}, f"Baked {baked} anime eye FX channels and repacked maps.")
+        return {'FINISHED'}
+
+class GENOS_OT_download_pattern_preset(bpy.types.Operator):
+    bl_idname = "genos.download_pattern_preset"
+    bl_label = "Download Pattern Preset"
+    bl_description = "Download selected pattern texture pack and cache it offline"
+
+    pattern_key: EnumProperty(
+        name="Pattern Key",
+        items=[
+            ("PANTYHOSE", "Pantyhose", ""),
+            ("STRIPES", "Stripes", ""),
+            ("RIPPED", "Ripped", ""),
+            ("BODYSUIT_HEX", "Bodysuit Hex", ""),
+            ("DOTS", "Dots", ""),
+            ("COTTON", "Cotton", ""),
+            ("LEATHER", "Leather", ""),
+        ],
+        default="PANTYHOSE"
+    )
+
+    def execute(self, context):
+        try:
+            result = download_pattern_preset(context.scene, self.pattern_key)
+        except Exception as e:
+            try:
+                context.scene.genos_pattern_last_download_report = f"{self.pattern_key}: {e}"
+            except Exception:
+                pass
+            self.report({'ERROR'}, f"Pattern download failed ({self.pattern_key}): {e}")
+            return {'CANCELLED'}
+
+        try:
+            context.scene.genos_pattern_last_download_report = f"{self.pattern_key}: OK"
+        except Exception:
+            pass
+
+        has_color = bool(result.get("color"))
+        if has_color:
+            self.report({'INFO'}, f"Downloaded {self.pattern_key} to offline cache.")
+            return {'FINISHED'}
+        self.report({'WARNING'}, f"Downloaded {self.pattern_key}, but no color map was found in the ZIP.")
+        return {'FINISHED'}
+
+class GENOS_OT_download_all_pattern_presets(bpy.types.Operator):
+    bl_idname = "genos.download_all_pattern_presets"
+    bl_label = "Download All Pattern Presets"
+    bl_description = "Download all configured pattern preset texture packs for offline use"
+
+    def execute(self, context):
+        ok = 0
+        fail = 0
+        errors = []
+        for key in PATTERN_PRESET_KEYS:
+            try:
+                result = download_pattern_preset(context.scene, key)
+                if result.get("color"):
+                    ok += 1
+                else:
+                    fail += 1
+                    errors.append(f"{key}: no color map detected")
+            except Exception as e:
+                fail += 1
+                errors.append(f"{key}: {e}")
+
+        report_text = " | ".join(errors[:6]) if errors else "OK"
+        try:
+            context.scene.genos_pattern_last_download_report = report_text
+        except Exception:
+            pass
+        if ok == 0:
+            self.report({'ERROR'}, f"No pattern presets were downloaded successfully. {report_text}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Downloaded {ok} preset(s) to offline cache. Failed: {fail}. {report_text}")
+        return {'FINISHED'}
+
+class GENOS_OT_apply_cached_pattern_preset(bpy.types.Operator):
+    bl_idname = "genos.apply_cached_pattern_preset"
+    bl_label = "Apply Cached Pattern Preset"
+    bl_description = "Link cached pattern textures to active material and rebuild node tree"
+
+    pattern_key: EnumProperty(
+        name="Pattern Key",
+        items=[
+            ("PANTYHOSE", "Pantyhose", ""),
+            ("STRIPES", "Stripes", ""),
+            ("RIPPED", "Ripped", ""),
+            ("BODYSUIT_HEX", "Bodysuit Hex", ""),
+            ("DOTS", "Dots", ""),
+            ("COTTON", "Cotton", ""),
+            ("LEATHER", "Leather", ""),
+        ],
+        default="PANTYHOSE"
+    )
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH' or not obj.active_material:
+            return {'CANCELLED'}
+        mat = obj.active_material
+        if "is_anime_toon" not in mat:
+            self.report({'ERROR'}, "Active material is not an AnimeToon shader.")
+            return {'CANCELLED'}
+
+        paths = cached_pattern_paths(context.scene, self.pattern_key)
+        if not paths.get("color"):
+            self.report({'ERROR'}, f"No cached color map found for {self.pattern_key}. Download first.")
+            return {'CANCELLED'}
+
+        color_img = load_or_reload_image(paths.get("color"), non_color=False)
+        rough_img = load_or_reload_image(paths.get("roughness"), non_color=True) if paths.get("roughness") else None
+        normal_img = load_or_reload_image(paths.get("normal"), non_color=True) if paths.get("normal") else None
+        if color_img is None:
+            self.report({'ERROR'}, f"Failed to load cached color map for {self.pattern_key}.")
+            return {'CANCELLED'}
+
+        try:
+            mat.genos_pattern_color_map = color_img
+            if rough_img:
+                mat.genos_pattern_roughness_map = rough_img
+            if normal_img:
+                mat.genos_pattern_normal_map = normal_img
+            old_tint = tuple(getattr(context.scene, "genos_pattern_tint", (1.0, 1.0, 1.0, 1.0)))
+            if len(old_tint) >= 3 and abs(old_tint[0] - 0.08) < 1e-6 and abs(old_tint[1] - 0.08) < 1e-6 and abs(old_tint[2] - 0.08) < 1e-6:
+                context.scene.genos_pattern_tint = (1.0, 1.0, 1.0, 1.0)
+        except Exception:
+            pass
+
+        if self.pattern_key in {"PANTYHOSE", "STRIPES", "RIPPED", "BODYSUIT_HEX", "DOTS", "COTTON", "LEATHER"}:
+            context.scene.genos_clothing_pattern_type = self.pattern_key
+
+        try:
+            bpy.ops.genos.regenerate_shader()
+        except Exception as e:
+            self.report({'WARNING'}, f"Pattern assigned, but shader regen failed: {e}")
+            return {'FINISHED'}
+
+        self.report({'INFO'}, f"Applied cached {self.pattern_key} pattern to {mat.name}.")
+        return {'FINISHED'}
+
 class GENOS_OT_set_paint_target(bpy.types.Operator):
     bl_idname = "genos.set_paint_target"
     bl_label = "Set Paint Target"
@@ -2724,17 +4439,48 @@ class GENOS_OT_set_paint_target(bpy.types.Operator):
     def execute(self, context):
         obj = active_mesh_object(context)
         if not obj or not obj.active_material: return {'CANCELLED'}
+        mat = obj.active_material
         
         target = context.scene.genos_paint_target
-        node = set_active_image_node(obj.active_material, target)
+        node = set_active_image_node(mat, target)
+
+        # Ensure Pattern Mask always has a valid image so painting affects shader output.
+        if target == "PATTERN_MASK" and node is not None and getattr(node, "image", None) is None:
+            try:
+                img = ensure_source_image(mat, "Pattern Mask", "PatternMask", (0.0, 0.0, 0.0, 1.0), MASK_COLORSPACE)
+                node.image = img
+                try:
+                    mat["genos_pattern_mask_image"] = img.name
+                except Exception:
+                    pass
+            except Exception as e:
+                self.report({'ERROR'}, f"Failed to create Pattern Mask image: {e}")
+                return {'CANCELLED'}
         
         if node is None or node.image is None: return {'CANCELLED'}
+        set_image_colorspace(node.image, MASK_COLORSPACE if target == "PATTERN_MASK" else "sRGB")
+        try:
+            node.image.update()
+        except Exception:
+            pass
         
         # FIXED: Tell Blender's active tool system to target the node's image directly
         try:
             if getattr(context.tool_settings, "image_paint", None):
                 context.tool_settings.image_paint.mode = 'IMAGE'
                 context.tool_settings.image_paint.canvas = node.image
+                # Pattern mask uses black=off, white=on; default brush to white reveal.
+                if target == "PATTERN_MASK" and context.tool_settings.image_paint.brush:
+                    brush = context.tool_settings.image_paint.brush
+                    brush.color = (1.0, 1.0, 1.0)
+                    try:
+                        brush.secondary_color = (0.0, 0.0, 0.0)
+                    except Exception:
+                        pass
+                    try:
+                        brush.strength = 1.0
+                    except Exception:
+                        pass
         except Exception as e:
             print(f"Paint Target Override Error: {e}")
 
@@ -2931,6 +4677,111 @@ class GENOS_OT_save_all(bpy.types.Operator):
                     
             return temp_mat
 
+        def create_basecolor_export_material(mat_name, base_img, pattern_mask_img=None, pattern_color_img=None):
+            temp_mat = bpy.data.materials.new(mat_name)
+            temp_mat.use_nodes = True
+            temp_mat.blend_method = 'BLEND'
+            nodes = temp_mat.node_tree.nodes
+            links = temp_mat.node_tree.links
+            nodes.clear()
+
+            out = nodes.new("ShaderNodeOutputMaterial")
+            emit = nodes.new("ShaderNodeEmission")
+            uv_node = nodes.new("ShaderNodeUVMap")
+            uv_node.uv_map = "Quad_UV"
+
+            base_tex = nodes.new("ShaderNodeTexImage")
+            base_tex.name = "ExportBaseColor"
+            base_tex.image = base_img
+            base_tex.interpolation = 'Linear'
+            links.new(uv_node.outputs[0], base_tex.inputs["Vector"])
+
+            final_color = base_tex.outputs["Color"]
+
+            pattern_type = getattr(s, "genos_clothing_pattern_type", "NONE")
+            pattern_strength_val = max(0.0, min(1.0, float(getattr(s, "genos_pattern_strength", 0.55))))
+            use_pattern = pattern_type != "NONE" and pattern_mask_img is not None and (pattern_color_img is not None or pattern_strength_val > 0.0)
+
+            if use_pattern:
+                p_map = nodes.new("ShaderNodeMapping")
+                p_map.name = "ExportPatternMapping"
+                links.new(uv_node.outputs[0], p_map.inputs["Vector"])
+                try:
+                    sc = max(0.01, float(getattr(s, "genos_pattern_scale", 20.0)))
+                    p_map.inputs["Scale"].default_value = (sc, sc, 1.0)
+                    p_map.inputs["Rotation"].default_value = (0.0, 0.0, float(getattr(s, "genos_pattern_rotation", 0.0)))
+                except Exception:
+                    pass
+
+                mask_tex = nodes.new("ShaderNodeTexImage")
+                mask_tex.name = "ExportPatternMask"
+                mask_tex.image = pattern_mask_img
+                mask_tex.interpolation = 'Linear'
+                links.new(uv_node.outputs[0], mask_tex.inputs["Vector"])
+
+                mask_bw = nodes.new("ShaderNodeRGBToBW")
+                links.new(mask_tex.outputs["Color"], mask_bw.inputs["Color"])
+
+                mask_strength = nodes.new("ShaderNodeMath")
+                mask_strength.operation = 'MULTIPLY'
+                mask_strength.use_clamp = True
+                mask_strength.inputs[1].default_value = pattern_strength_val
+                links.new(mask_bw.outputs["Val"], mask_strength.inputs[0])
+
+                if pattern_color_img is not None:
+                    p_tex = nodes.new("ShaderNodeTexImage")
+                    p_tex.name = "ExportPatternColor"
+                    p_tex.image = pattern_color_img
+                    p_tex.interpolation = 'Linear'
+                    links.new(p_map.outputs["Vector"], p_tex.inputs["Vector"])
+
+                    tint_mul = nodes.new("ShaderNodeMix")
+                    tint_mul.data_type = 'RGBA'
+                    tint_mul.blend_type = 'MULTIPLY'
+                    find_socket(tint_mul.inputs, "Factor", "Fac").default_value = 1.0
+                    links.new(p_tex.outputs["Color"], find_socket(tint_mul.inputs, "A", "Color1"))
+                    find_socket(tint_mul.inputs, "B", "Color2").default_value = tuple(getattr(s, "genos_pattern_tint", (1.0, 1.0, 1.0, 1.0)))
+                    pattern_color = find_socket(tint_mul.outputs, "Result", "Color")
+                else:
+                    rgb = nodes.new("ShaderNodeRGB")
+                    rgb.outputs[0].default_value = tuple(getattr(s, "genos_pattern_tint", (1.0, 1.0, 1.0, 1.0)))
+                    pattern_color = rgb.outputs[0]
+
+                # Match live shader behavior: procedural pattern shapes the pattern detail,
+                # while the painted mask controls where it is applied.
+                pattern_proc = _build_clothing_pattern_factor(nodes, links, s, pattern_type)
+                pattern_detail = nodes.new("ShaderNodeMix")
+                pattern_detail.data_type = 'RGBA'
+                pattern_detail.blend_type = 'MULTIPLY'
+                find_socket(pattern_detail.inputs, "Factor", "Fac").default_value = 1.0
+                links.new(pattern_color, find_socket(pattern_detail.inputs, "A", "Color1"))
+                links.new(pattern_proc, find_socket(pattern_detail.inputs, "B", "Color2"))
+
+                base_mul = nodes.new("ShaderNodeMix")
+                base_mul.data_type = 'RGBA'
+                base_mul.blend_type = 'MULTIPLY'
+                find_socket(base_mul.inputs, "Factor", "Fac").default_value = 1.0
+                links.new(base_tex.outputs["Color"], find_socket(base_mul.inputs, "A", "Color1"))
+                links.new(find_socket(pattern_detail.outputs, "Result", "Color"), find_socket(base_mul.inputs, "B", "Color2"))
+
+                pattern_mix = nodes.new("ShaderNodeMix")
+                pattern_mix.data_type = 'RGBA'
+                pattern_mix.blend_type = 'MIX'
+                links.new(mask_strength.outputs[0], find_socket(pattern_mix.inputs, "Factor", "Fac"))
+                links.new(base_tex.outputs["Color"], find_socket(pattern_mix.inputs, "A", "Color1"))
+                links.new(find_socket(base_mul.outputs, "Result", "Color"), find_socket(pattern_mix.inputs, "B", "Color2"))
+                final_color = find_socket(pattern_mix.outputs, "Result", "Color")
+
+            links.new(final_color, emit.inputs["Color"])
+
+            transp = nodes.new("ShaderNodeBsdfTransparent")
+            mix = nodes.new("ShaderNodeMixShader")
+            links.new(transp.outputs[0], mix.inputs[1])
+            links.new(emit.outputs[0], mix.inputs[2])
+            links.new(base_tex.outputs["Alpha"], mix.inputs["Fac"])
+            links.new(mix.outputs[0], out.inputs[0])
+            return temp_mat
+
         packs_to_render = []
 
         # Queue 1: Colored ILM Map (Opaque RGB Format, use_alpha = False)
@@ -2953,7 +4804,16 @@ class GENOS_OT_save_all(bpy.types.Operator):
         # Queue 3: Standard Maps (BaseColor supports Alpha, Emission is Opaque)
         base_img = get_img("BaseColor")
         if base_img:
-            packs_to_render.append((create_simple_material("TEMP_PACK_BASE", base_img, True), f"{mat_base}{getattr(s, 'genos_exp_suf_albedo', '_BaseColor')}.png", True))
+            packs_to_render.append((
+                create_basecolor_export_material(
+                    "TEMP_PACK_BASE",
+                    base_img,
+                    get_img("Pattern Mask"),
+                    getattr(mat, "genos_pattern_color_map", None)
+                ),
+                f"{mat_base}{getattr(s, 'genos_exp_suf_albedo', '_BaseColor')}.png",
+                True
+            ))
             
         emit_img = get_img("Emission Map")
         if emit_img:
@@ -2964,6 +4824,10 @@ class GENOS_OT_save_all(bpy.types.Operator):
             sdf_img = get_img("SDF Map")
             if sdf_img:
                 packs_to_render.append((create_simple_material("TEMP_PACK_SDF", sdf_img, False), f"{mat_base}{getattr(s, 'genos_exp_suf_sdf', '_SDF')}.png", False))
+
+        disp_img = get_img("Displacement Map")
+        if disp_img and getattr(s, "genos_bake_displacement", False):
+            packs_to_render.append((create_simple_material("TEMP_PACK_DISP", disp_img, False), f"{mat_base}{getattr(s, 'genos_exp_suf_displacement', '_Displacement')}.png", False))
 
         # Execute Live Camera Baking Queue
         for temp_mat, target_filename, use_alpha in packs_to_render:
@@ -3023,7 +4887,7 @@ class GENOS_OT_save_all(bpy.types.Operator):
             sdf_img = get_or_load(sdf_path, False) if mat.get("genos_shader_type") == 'FACE' else None
             
             try:
-                build_baked_material(baked_mat, b_img, e_img, mat.genos_normal_map, i_img, d_img, sdf_img)
+                build_baked_material(baked_mat, b_img, e_img, mat.genos_normal_map, i_img, d_img, sdf_img, mat.genos_displacement_map, get_img("Pattern Mask"))
             except Exception as e:
                 print(e)
 
@@ -3131,6 +4995,16 @@ class GENOS_PT_workspace_panel(bpy.types.Panel):
             img_box.label(text="Packed Detail Map (RGBA):")
             img_box.template_ID(mat, "genos_detail_packed", open="image.open")
 
+            pattern_node = mat.node_tree.nodes.get("Pattern Mask")
+            if pattern_node:
+                img_box.label(text="Pattern Mask:")
+                img_box.template_ID(pattern_node, "image", open="image.open")
+                img_box.label(text="Pattern Color Map:")
+                img_box.template_ID(mat, "genos_pattern_color_map", open="image.open")
+
+            img_box.label(text="Displacement Map:")
+            img_box.template_ID(mat, "genos_displacement_map", open="image.open")
+
             if sh_type == 'FACE':
                 sdf_node = mat.node_tree.nodes.get("SDF Map")
                 if sdf_node:
@@ -3155,35 +5029,93 @@ class GENOS_PT_workspace_panel(bpy.types.Panel):
             
             curve_box = tools_box.box()
             curve_box.label(text="Auto-Generate Edge Lineart:")
+            curve_box.prop(s, "genos_lineart_preset", text="Preset")
             row = curve_box.row(align=True)
             row.prop(s, "genos_lineart_radius", text="Radius")
+            curve_box.prop(s, "genos_lineart_samples", text="Samples")
+            edge_row = curve_box.row(align=True)
+            edge_row.prop(s, "genos_lineart_edge_min", text="Edge Min")
+            edge_row.prop(s, "genos_lineart_edge_max", text="Edge Max")
+            curve_box.prop(s, "genos_lineart_gamma", text="Sharpness")
+            curve_box.prop(s, "genos_lineart_smooth", text="Smooth Sharp Bake")
             row.operator("genos.bake_curvature", icon='MATCLOTH', text="Bake Lineart")
 
+            pattern_box = tools_box.box()
+            pattern_box.label(text="Clothing Pattern Layer:")
+            pattern_box.prop(s, "genos_clothing_pattern_type", text="Type")
+            pattern_box.prop(s, "genos_pattern_scale", text="Scale")
+            pattern_box.prop(s, "genos_pattern_rotation", text="Rotation")
+            pattern_box.prop(s, "genos_pattern_strength", text="Strength")
+            pattern_box.prop(s, "genos_pattern_tint", text="Tint")
+            pattern_box.label(text="Use Pattern Mask paint target to place layer on mesh regions.", icon='INFO')
+
+            cache_box = pattern_box.box()
+            cache_box.label(text="Offline Pattern Library:")
+            cache_box.prop(s, "genos_pattern_cache_dir", text="Cache Dir")
+            row = cache_box.row(align=True)
+            row.operator("genos.download_all_pattern_presets", icon='IMPORT', text="Download All")
+
+            preset_map = [
+                ("PANTYHOSE", "Pantyhose"),
+                ("STRIPES", "Stripes"),
+                ("RIPPED", "Ripped"),
+                ("BODYSUIT_HEX", "Bodysuit Hex"),
+                ("DOTS", "Dots"),
+                ("COTTON", "Cotton"),
+                ("LEATHER", "Leather"),
+            ]
+            for key, label in preset_map:
+                row = cache_box.row(align=True)
+                d = row.operator("genos.download_pattern_preset", text=f"Download {label}", icon='IMPORT')
+                d.pattern_key = key
+                a = row.operator("genos.apply_cached_pattern_preset", text="Apply", icon='CHECKMARK')
+                a.pattern_key = key
+
+            src_box = cache_box.box()
+            src_box.label(text="Source ZIP URLs (editable):")
+            src_box.prop(s, "genos_pattern_url_pantyhose", text="Pantyhose")
+            src_box.prop(s, "genos_pattern_url_stripes", text="Stripes")
+            src_box.prop(s, "genos_pattern_url_ripped", text="Ripped")
+            src_box.prop(s, "genos_pattern_url_bodysuit", text="Bodysuit")
+            src_box.prop(s, "genos_pattern_url_dots", text="Dots")
+            src_box.prop(s, "genos_pattern_url_cotton", text="Cotton")
+            src_box.prop(s, "genos_pattern_url_leather", text="Leather")
+            if getattr(s, "genos_pattern_last_download_report", ""):
+                cache_box.label(text=f"Last: {s.genos_pattern_last_download_report}", icon='INFO')
             spec_box = tools_box.box()
             spec_box.label(text="Auto-Generate Specular:")
             row = spec_box.row(align=True)
             row.prop(s, "genos_spec_mat_type", text="")
             row.operator("genos.bake_specular", icon='LIGHT_SUN', text="Bake Specular")
+
+            fx_box = tools_box.box()
+            fx_box.label(text="Anime Hair/Eye FX to ILM + Detail:")
+            fx_box.prop(s, "genos_hair_highlight_strength", text="Hair Strength")
+            fx_box.prop(s, "genos_eye_sparkle_strength", text="Eye Strength")
+            fx_box.operator("genos.bake_anime_fx", icon='SHADING_TEXTURE', text="Bake Anime Hair/Eye FX")
+            
+            disp_box = tools_box.box()
+            disp_box.label(text="Displacement / Depth:")
+            disp_box.prop(s, "genos_bake_displacement", text="Bake Displacement")
+            disp_box.prop(s, "genos_displacement_strength", text="Strength")
+            disp_box.operator("genos.bake_displacement", icon='MOD_DISPLACE', text="Bake Displacement")
+
+            norm_box = tools_box.box()
+            norm_box.label(text="Normal Map:")
+            norm_box.operator("genos.bake_normal", icon='MOD_NORMALEDIT', text="Bake Normal Details")
+
+            # --- BULLETPROOF SDF UI CHECK ---
+            # Checks if the node actually exists in the active material
+            if mat.node_tree.nodes.get("SDF Map"):
+                sdf_box = tools_box.box()
+                sdf_box.label(text="Auto-Generate Face SDF:")
+                sdf_box.operator("genos.bake_sdf", icon='LIGHT_HEMI', text="Bake SDF Baseline")
             
             live_box = layout.box()
             live_box.label(text="Live Texture Packing", icon='TEXTURE')
             live_row = live_box.row(align=True)
             live_row.operator("genos.pack_ilm", icon='MOD_HUE_SATURATION', text="Pack ILM Maps")
             live_row.operator("genos.pack_detail", icon='MOD_HUE_SATURATION', text="Pack Detail Maps")
-
-            pack_box = layout.box()
-            pack_box.label(text="Final Game Export", icon='EXPORT')
-            pack_box.label(text="Dynamically exports based on current Material Name", icon='INFO')
-            
-            name_box = pack_box.box()
-            name_box.label(text="Target Output Suffixes:", icon='FILE_BLANK')
-            name_col = name_box.column(align=True)
-            name_col.prop(s, "genos_exp_suf_albedo", text="BaseColor")
-            name_col.prop(s, "genos_exp_suf_emission", text="Emission")
-            name_col.prop(s, "genos_exp_suf_ilm", text="ILM Name")
-            name_col.prop(s, "genos_exp_suf_detail", text="Detail Name")
-            if sh_type == 'FACE':
-                name_col.prop(s, "genos_exp_suf_sdf", text="SDF Name")
             
             pack_box = layout.box()
             pack_box.label(text="Final Game Export", icon='EXPORT')
@@ -3241,13 +5173,20 @@ class GENOS_PT_guide_panel(bpy.types.Panel):
         box.label(text="• Detail.B (Accent): Overlays blush or body decals.", icon='DOT')
         box.label(text="• Detail.A (Extra): Secondary glowing layer.", icon='DOT')
 
+        box = layout.box()
+        box.label(text="4. Anime FX Auto-Bake", icon='SHADING_TEXTURE')
+        box.label(text="• Hair shaders: Bakes strand highlights to ILM Spec/Rim and Detail Accent.", icon='DOT')
+        box.label(text="• Other shaders: Bakes eye sparkle + iris ring to ILM and Detail glow channels.", icon='DOT')
+
 # -------------------------------------------------------------------
 # Registration
 # -------------------------------------------------------------------
 
 classes = (
     GENOS_OT_create_workspace, GENOS_OT_fix_render_settings, GENOS_OT_repair_textures, GENOS_OT_regenerate_shader, GENOS_OT_add_outline, 
-    GENOS_OT_bake_ao, GENOS_OT_bake_curvature, GENOS_OT_bake_specular,
+    GENOS_OT_bake_ao, GENOS_OT_bake_curvature, GENOS_OT_bake_specular,GENOS_OT_bake_sdf, GENOS_OT_bake_displacement, GENOS_OT_bake_normal,
+    GENOS_OT_bake_anime_fx,
+    GENOS_OT_download_pattern_preset, GENOS_OT_download_all_pattern_presets, GENOS_OT_apply_cached_pattern_preset,
     GENOS_OT_set_paint_target, GENOS_OT_bake_preview_appearance,
     GENOS_OT_pack_ilm, GENOS_OT_pack_detail, GENOS_OT_save_all, 
     GENOS_PT_workspace_panel, GENOS_PT_guide_panel
