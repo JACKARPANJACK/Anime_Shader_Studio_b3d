@@ -1371,32 +1371,13 @@ def execute_bake(context, mat, target_node_name, is_ao=False, *, colorspace=MASK
         set_image_colorspace(img, colorspace)
     fill_image_solid(img, prefill_color if prefill_color is not None else ((1.0, 1.0, 1.0, 1.0) if is_ao else (0.0, 0.0, 0.0, 1.0)))
 
-    bpy.ops.object.select_all(action='DESELECT')
-    obj.select_set(True)
-    context.view_layer.objects.active = obj
+    # USER RULE ENFORCEMENT: Never use Cycles bake, always use Eevee camera live bake.
+    success = _bake_material_via_live_camera(context, obj, mat, img)
 
-    activate_bake_image_node(mat, node)
-    context.view_layer.update()
-
-    bake_state = capture_bake_state(context.scene)
-
-    configure_internal_bake(context.scene, 128 if is_ao else 64, is_ao=is_ao)
-
-    success = False
-    try:
-        # For AO bakes, never clear to black; preserve prefilled 1.0 values across un-occluded/un-hit UV areas
-        success = bake_active_image('AO' if is_ao else 'EMIT', margin=16, use_clear=False)
-        img.update()
-        if pack_after:
-            try: img.pack()
-            except Exception: pass
-    except Exception as e:
-        print("Bake Exception:", e)
-    finally:
-        restore_bake_state(context.scene, bake_state)
-
-    return success
-
+    if success and pack_after:
+        try: img.pack()
+        except Exception: pass
+        
     return success
 
 def material_base_name(mat):
