@@ -1356,7 +1356,7 @@ def bake_active_image(pass_type, *, margin=16, use_clear=False):
     )
     return 'FINISHED' in result
 
-def execute_bake(context, mat, target_node_name, is_ao=False, *, colorspace=MASK_COLORSPACE, prefill_color=None, pack_after=True):
+def execute_bake(context, mat, target_node_name, is_ao=False, *, colorspace=MASK_COLORSPACE, prefill_color=None, pack_after=True, cleanup_cb=None):
     obj = context.active_object
     if not obj or obj.type != 'MESH' or not obj.data.uv_layers: return False
     if not mat or not mat.use_nodes: return False
@@ -1372,12 +1372,14 @@ def execute_bake(context, mat, target_node_name, is_ao=False, *, colorspace=MASK
     fill_image_solid(img, prefill_color if prefill_color is not None else ((1.0, 1.0, 1.0, 1.0) if is_ao else (0.0, 0.0, 0.0, 1.0)))
 
     # USER RULE ENFORCEMENT: Never use Cycles bake, always use Eevee camera live bake.
-    success = _bake_material_via_live_camera(context, obj, mat, img)
-
-    if success and pack_after:
-        try: img.pack()
-        except Exception: pass
+    def _exec_cleanup():
+        if pack_after:
+            try: img.pack()
+            except: pass
+        if cleanup_cb: cleanup_cb()
         
+    success = _bake_material_via_live_camera(context, obj, mat, img, cleanup_cb=_exec_cleanup)
+    
     return success
 
 def material_base_name(mat):
@@ -7256,19 +7258,24 @@ class GENOS_OT_bake_specular(bpy.types.Operator):
         orig_mats = [s.material for s in obj.material_slots]
         orig_active_index = obj.active_material_index
         success = False
-        try:
-            for s in obj.material_slots:
-                s.material = temp_mat
-            success = execute_bake(context, temp_mat, "ILM_Spec", is_ao=False)
-        finally:
+
+        def _cleanup():
             for i, s in enumerate(obj.material_slots):
                 if i < len(orig_mats):
                     s.material = orig_mats[i]
             obj.active_material_index = orig_active_index
-            bpy.data.materials.remove(temp_mat)
+            try:
+                if temp_mat.name in bpy.data.materials:
+                    bpy.data.materials.remove(temp_mat)
+            except: pass
             if orig_mode != 'OBJECT':
                 try: bpy.ops.object.mode_set(mode=orig_mode)
                 except Exception: pass
+
+        for s in obj.material_slots:
+            s.material = temp_mat
+            
+        success = execute_bake(context, temp_mat, "ILM_Spec", is_ao=False, cleanup_cb=_cleanup)
 
         if success:
             pack_material_ilm(mat)
@@ -7344,25 +7351,32 @@ class GENOS_OT_bake_ao(bpy.types.Operator):
             bpy.ops.object.material_slot_add()
             orig_mats = [None]
             
-        for slot in obj.material_slots:
-            slot.material = temp_ao_mat
+        orig_mats = [slot.material for slot in obj.material_slots]
+        orig_active_index = obj.active_material_index
         
-        success = False
-        try:
-            success = execute_bake(context, temp_ao_mat, "Detail_AO", is_ao=True)
-        except Exception as e: 
-            self.report({'ERROR'}, f"AO Bake failed: {e}")
-        finally:
+        def _cleanup():
             for i, slot in enumerate(obj.material_slots):
                 if i < len(orig_mats): slot.material = orig_mats[i]
             obj.active_material_index = orig_active_index
-            bpy.data.materials.remove(temp_ao_mat)
-            
+            try:
+                if temp_ao_mat.name in bpy.data.materials:
+                    bpy.data.materials.remove(temp_ao_mat)
+            except: pass
             for o, state in hidden_states.items():
                 o.hide_render = state
             if orig_mode != 'OBJECT':
                 try: bpy.ops.object.mode_set(mode=orig_mode)
                 except Exception: pass
+
+        for slot in obj.material_slots:
+            slot.material = temp_ao_mat
+        
+        success = False
+        try:
+            success = execute_bake(context, temp_ao_mat, "Detail_AO", is_ao=True, cleanup_cb=_cleanup)
+        except Exception as e: 
+            self.report({'ERROR'}, f"AO Bake failed: {e}")
+            _cleanup()
                  
         if success:
             try:
@@ -7452,22 +7466,24 @@ class GENOS_OT_bake_sdf(bpy.types.Operator):
         orig_mats = [s.material for s in obj.material_slots]
         orig_active_index = obj.active_material_index
         success = False
-        try:
-            for s in obj.material_slots:
-                s.material = temp_mat
-            
-            # Execute the internal bake pipeline (Emission mode)
-            success = execute_bake(context, temp_mat, "SDF Map", is_ao=False)
-        finally:
-            # Restore original materials
+        
+        def _cleanup():
             for i, s in enumerate(obj.material_slots):
                 if i < len(orig_mats):
                     s.material = orig_mats[i]
             obj.active_material_index = orig_active_index
-            bpy.data.materials.remove(temp_mat)
+            try:
+                if temp_mat.name in bpy.data.materials:
+                    bpy.data.materials.remove(temp_mat)
+            except: pass
             if orig_mode != 'OBJECT':
                 try: bpy.ops.object.mode_set(mode=orig_mode)
                 except Exception: pass
+                
+        for s in obj.material_slots:
+            s.material = temp_mat
+            
+        success = execute_bake(context, temp_mat, "SDF Map", is_ao=False, cleanup_cb=_cleanup)
 
         if success:
             self.report({'INFO'}, "Successfully baked baseline SDF Map.")
@@ -7705,19 +7721,24 @@ class GENOS_OT_bake_curvature(bpy.types.Operator):
         orig_mats = [s.material for s in obj.material_slots]
         orig_active_index = obj.active_material_index
         success = False
-        try:
-            for s in obj.material_slots:
-                s.material = temp_mat
-            success = execute_bake(context, temp_mat, "Detail_Curve", is_ao=False)
-        finally:
+        
+        def _cleanup():
             for i, s in enumerate(obj.material_slots):
                 if i < len(orig_mats):
                     s.material = orig_mats[i]
             obj.active_material_index = orig_active_index
-            bpy.data.materials.remove(temp_mat)
+            try:
+                if temp_mat.name in bpy.data.materials:
+                    bpy.data.materials.remove(temp_mat)
+            except: pass
             if orig_mode != 'OBJECT':
                 try: bpy.ops.object.mode_set(mode=orig_mode)
                 except Exception: pass
+                
+        for s in obj.material_slots:
+            s.material = temp_mat
+            
+        success = execute_bake(context, temp_mat, "Detail_Curve", is_ao=False, cleanup_cb=_cleanup)
 
         if success:
             pack_material_detail(mat)
@@ -7792,7 +7813,13 @@ def _bake_material_via_live_camera(context, src_obj, temp_mat, target_img, clean
     orig_film_transp, orig_color_mode = scene.render.film_transparent, scene.render.image_settings.color_mode
     orig_view_transform, orig_look = scene.view_settings.view_transform, scene.view_settings.look
     orig_filepath = scene.render.filepath
+    orig_engine = scene.render.engine
     
+    try: scene.render.engine = 'BLENDER_EEVEE_NEXT'
+    except:
+        try: scene.render.engine = 'BLENDER_EEVEE'
+        except: pass
+
     scene.render.resolution_x = size
     scene.render.resolution_y = size
     scene.render.resolution_percentage = 100 
@@ -7833,6 +7860,7 @@ def _bake_material_via_live_camera(context, src_obj, temp_mat, target_img, clean
             scene.render.film_transparent, scene.render.image_settings.color_mode = orig_film_transp, orig_color_mode
             scene.view_settings.view_transform, scene.view_settings.look = orig_view_transform, orig_look
             scene.render.filepath = orig_filepath
+            scene.render.engine = orig_engine
             for ob, state in hidden_states.items(): ob.hide_render = state
             bpy.data.objects.remove(proxy_obj)
             bpy.data.meshes.remove(proxy_mesh)
@@ -7906,7 +7934,10 @@ def _bake_generated_mask(context, obj, target_img, target_node_name, graph_build
             if i < len(orig_mats):
                 slot.material = orig_mats[i]
         obj.active_material_index = orig_active_index
-        bpy.data.materials.remove(temp_mat)
+        try:
+            if temp_mat.name in bpy.data.materials:
+                bpy.data.materials.remove(temp_mat)
+        except: pass
         if orig_mode != 'OBJECT':
             try: bpy.ops.object.mode_set(mode=orig_mode)
             except Exception: pass
