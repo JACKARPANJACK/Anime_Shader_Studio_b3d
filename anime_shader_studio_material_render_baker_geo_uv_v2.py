@@ -7740,7 +7740,7 @@ def _connect_mask_to_emission(nodes, links, emit_node, mask_socket):
     else:
         links.new(mask_socket, emit_node.inputs[0])
 
-def _bake_material_via_live_camera(context, src_obj, temp_mat, target_img):
+def _bake_material_via_live_camera(context, src_obj, temp_mat, target_img, cleanup_cb=None):
     import os
     import tempfile
     size = target_img.size[0]
@@ -7814,34 +7814,48 @@ def _bake_material_via_live_camera(context, src_obj, temp_mat, target_img):
     try: bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
     except: pass
 
-    success = True
+    def finish_handler(scn=None):
+        if finish_handler in bpy.app.handlers.render_complete: bpy.app.handlers.render_complete.remove(finish_handler)
+        if finish_handler in bpy.app.handlers.render_cancel: bpy.app.handlers.render_cancel.remove(finish_handler)
+        
+        try:
+            if os.path.exists(tmp_path):
+                rendered_img = bpy.data.images.load(tmp_path)
+                target_img.pixels = rendered_img.pixels
+                bpy.data.images.remove(rendered_img)
+                target_img.update()
+                target_img.pack()
+        except Exception as e: print("Async Image Load Error:", e)
+
+        try:
+            context.preferences.view.render_display_type = orig_display
+            scene.camera = orig_camera
+            scene.render.resolution_x, scene.render.resolution_y, scene.render.resolution_percentage = orig_res_x, orig_res_y, orig_res_pct
+            scene.render.film_transparent, scene.render.image_settings.color_mode = orig_film_transp, orig_color_mode
+            scene.view_settings.view_transform, scene.view_settings.look = orig_view_transform, orig_look
+            scene.render.filepath = orig_filepath
+            for ob, state in hidden_states.items(): ob.hide_render = state
+            bpy.data.objects.remove(proxy_obj)
+            bpy.data.meshes.remove(proxy_mesh)
+            bpy.data.objects.remove(cam_obj)
+            bpy.data.cameras.remove(cam_data)
+        except Exception as e: print("Async Cleanup Error:", e)
+        
+        if cleanup_cb:
+            try: cleanup_cb()
+            except Exception as e: print("Callback Error:", e)
+
+    bpy.app.handlers.render_complete.append(finish_handler)
+    bpy.app.handlers.render_cancel.append(finish_handler)
+
     try:
-        bpy.ops.render.render('EXEC_DEFAULT', write_still=True)
-        if os.path.exists(tmp_path):
-            rendered_img = bpy.data.images.load(tmp_path)
-            target_img.pixels = rendered_img.pixels
-            bpy.data.images.remove(rendered_img)
-            target_img.update()
-        else: success = False
+        bpy.ops.render.render('INVOKE_DEFAULT', write_still=True)
     except Exception as e:
         print('CAMERA_RENDER_ERROR:', e)
-        success = False
+        finish_handler()
+        return False
 
-    context.preferences.view.render_display_type = orig_display
-    scene.camera = orig_camera
-    scene.render.resolution_x, scene.render.resolution_y, scene.render.resolution_percentage = orig_res_x, orig_res_y, orig_res_pct
-    scene.render.film_transparent, scene.render.image_settings.color_mode = orig_film_transp, orig_color_mode
-    scene.view_settings.view_transform, scene.view_settings.look = orig_view_transform, orig_look
-    scene.render.filepath = orig_filepath
-
-    for ob, state in hidden_states.items(): ob.hide_render = state
-
-    bpy.data.objects.remove(proxy_obj)
-    bpy.data.meshes.remove(proxy_mesh)
-    bpy.data.objects.remove(cam_obj)
-    bpy.data.cameras.remove(cam_data)
-
-    return success
+    return True
 
 def _bake_generated_mask(context, obj, target_img, target_node_name, graph_builder, *, colorspace=MASK_COLORSPACE, prefill=(0.0, 0.0, 0.0, 1.0)):
     if target_img is None:
@@ -7886,23 +7900,25 @@ def _bake_generated_mask(context, obj, target_img, target_node_name, graph_build
     for slot in obj.material_slots:
         slot.material = temp_mat
 
-    success = False
-    try:
-        success = _bake_material_via_live_camera(context, obj, temp_mat, target_img)
-        if success:
-            try: target_img.pack()
-            except Exception: pass
-    finally:
+    def _cleanup():
         for i, slot in enumerate(obj.material_slots):
             if i < len(orig_mats):
                 slot.material = orig_mats[i]
         obj.active_material_index = orig_active_index
         bpy.data.materials.remove(temp_mat)
         if orig_mode != 'OBJECT':
-            try:
-                bpy.ops.object.mode_set(mode=orig_mode)
-            except Exception:
-                pass
+            try: bpy.ops.object.mode_set(mode=orig_mode)
+            except Exception: pass
+
+    success = False
+    try:
+        success = _bake_material_via_live_camera(context, obj, temp_mat, target_img, cleanup_cb=_cleanup)
+    except Exception as e:
+        print("Live Bake Exception:", e)
+        
+    if not success:
+        _cleanup()
+        
     return success
 
 def _build_dynamic_hair_band_bake_mask(nodes, links, scene, *, emission=False):
