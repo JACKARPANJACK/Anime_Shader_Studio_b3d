@@ -7077,9 +7077,22 @@ class GENOS_OT_bake_hair_ombre(bpy.types.Operator):
             if self.bake_mode == "BASE_COLOR":
                 existing_base = None
                 base_node = mat.node_tree.nodes.get("Base Color Map")
-                if base_node and getattr(base_node, "image", None):
+                
+                src_img = None
+                if base_node:
+                    if "genos_orig_base" in mat:
+                        src_img = bpy.data.images.get(mat["genos_orig_base"])
+                    if not src_img:
+                        src_img = getattr(base_node, "image", None)
+                
+                if src_img:
                     t_node = temp_nodes.new("ShaderNodeTexImage")
-                    t_node.image = base_node.image
+                    if src_img == target_img:
+                        temp_img = src_img.copy()
+                        temp_img.name = "TEMP_BAKE_COPY_" + target_img.name
+                        t_node.image = temp_img
+                    else:
+                        t_node.image = src_img
                     t_node.location = (-900, 300)
                     existing_base = t_node.outputs["Color"]
                 else:
@@ -7142,13 +7155,22 @@ class GENOS_OT_bake_hair_ombre(bpy.types.Operator):
         )
 
         if not success:
+            for img in bpy.data.images:
+                if img.name.startswith("TEMP_BAKE_COPY_"):
+                    bpy.data.images.remove(img)
             self.report({'ERROR'}, "Hair Ombre bake failed. Ensure Cycles is available.")
             return {'CANCELLED'}
+
+        for img in bpy.data.images:
+            if img.name.startswith("TEMP_BAKE_COPY_"):
+                bpy.data.images.remove(img)
 
         if self.bake_mode == "BASE_COLOR":
             mat.genos_base_color_map = target_img
             base_node = mat.node_tree.nodes.get("Base Color Map")
             if base_node:
+                if "genos_orig_base" not in mat and base_node.image and base_node.image != target_img:
+                    mat["genos_orig_base"] = base_node.image.name
                 base_node.image = target_img
             self.report({'INFO'}, f"Hair Ombre successfully baked into '{img_name}' and assigned as Base Color Map!")
         else:
