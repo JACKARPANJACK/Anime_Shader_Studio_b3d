@@ -1,0 +1,15 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Editor & OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.bak
+*~
+
+# Local test scratch / duplicate files
+* (2).py
+tests/
