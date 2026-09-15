@@ -7172,7 +7172,11 @@ class GENOS_OT_bake_hair_ombre(bpy.types.Operator):
                 if "genos_orig_base" not in mat and base_node.image and base_node.image != target_img:
                     mat["genos_orig_base"] = base_node.image.name
                 base_node.image = target_img
-            self.report({'INFO'}, f"Hair Ombre successfully baked into '{img_name}' and assigned as Base Color Map!")
+            
+            # Disable dynamic ombre to prevent double-tinting the now-baked texture
+            context.scene.genos_hair_tip_strength = 0.0
+            
+            self.report({'INFO'}, f"Hair Ombre baked into '{img_name}'. Dynamic ombre disabled to prevent double-tinting.")
         else:
             self.report({'INFO'}, f"Hair Ombre mask successfully baked into '{img_name}'!")
 
