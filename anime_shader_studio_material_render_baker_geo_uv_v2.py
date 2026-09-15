@@ -7744,20 +7744,11 @@ def _bake_material_via_live_camera(context, src_obj, temp_mat, target_img, clean
     import os
     import tempfile
     size = target_img.size[0]
-    proxy_obj, proxy_mesh = _make_uv_proxy_object(context, src_obj)
+    # Use a fullscreen quad per user request for "project texture on a quad"
+    proxy_obj, proxy_mesh = _make_fullscreen_quad()
     if not proxy_obj: return False
 
     scene = context.scene
-    for attr in src_obj.data.attributes:
-        if attr.data_type in {'FLOAT_COLOR', 'BYTE_COLOR'}:
-            proxy_attr = proxy_mesh.attributes.new(name=attr.name, type=attr.data_type, domain='POINT')
-            proxy_v_idx = 0
-            for poly in src_obj.data.polygons:
-                for li in poly.loop_indices:
-                    src_v_idx = src_obj.data.loops[li].vertex_index
-                    if attr.domain == 'POINT': proxy_attr.data[proxy_v_idx].color = attr.data[src_v_idx].color
-                    elif attr.domain == 'CORNER': proxy_attr.data[proxy_v_idx].color = attr.data[li].color
-                    proxy_v_idx += 1
 
     bake_col_name = "GENOS_LIVE_BAKE_DATA"
     if bake_col_name in bpy.data.collections: bake_col = bpy.data.collections[bake_col_name]
@@ -7769,7 +7760,7 @@ def _bake_material_via_live_camera(context, src_obj, temp_mat, target_img, clean
 
     hidden_states = {}
     for ob in scene.objects:
-        if ob.name != proxy_obj.name:
+        if ob.name not in [proxy_obj.name, 'GENOS_TEMP_CAM', 'GENOS_TEMP_SUN']:
             hidden_states[ob] = ob.hide_render
             ob.hide_render = True
 
@@ -7777,6 +7768,14 @@ def _bake_material_via_live_camera(context, src_obj, temp_mat, target_img, clean
     proxy_obj.hide_render = False
     proxy_obj.data.materials.clear()
     proxy_obj.data.materials.append(temp_mat)
+
+    # Lighting setup
+    sun_data = bpy.data.lights.new('GENOS_TEMP_SUN', type='SUN')
+    sun_data.energy = 4.0
+    sun_obj = bpy.data.objects.new('GENOS_TEMP_SUN', sun_data)
+    sun_obj.rotation_euler = (0.785398, 0.0, 0.785398)
+    bake_col.objects.link(sun_obj)
+    sun_obj.hide_render = False
 
     cam_data = bpy.data.cameras.new('GENOS_TEMP_CAM')
     cam_data.type = 'ORTHO'
@@ -7839,6 +7838,8 @@ def _bake_material_via_live_camera(context, src_obj, temp_mat, target_img, clean
             bpy.data.meshes.remove(proxy_mesh)
             bpy.data.objects.remove(cam_obj)
             bpy.data.cameras.remove(cam_data)
+            bpy.data.objects.remove(sun_obj)
+            bpy.data.lights.remove(sun_data)
         except Exception as e: print("Async Cleanup Error:", e)
         
         if cleanup_cb:
