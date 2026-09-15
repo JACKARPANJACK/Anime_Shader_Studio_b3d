@@ -7759,6 +7759,109 @@ def _connect_mask_to_emission(nodes, links, emit_node, mask_socket):
     else:
         links.new(mask_socket, emit_node.inputs[0])
 
+def _bake_material_via_live_camera(context, src_obj, temp_mat, target_img):
+    import os
+    import tempfile
+    size = target_img.size[0]
+    proxy_obj, proxy_mesh = _make_uv_proxy_object(context, src_obj)
+    if not proxy_obj: return False
+
+    scene = context.scene
+    for attr in src_obj.data.attributes:
+        if attr.data_type in {'FLOAT_COLOR', 'BYTE_COLOR'}:
+            proxy_attr = proxy_mesh.attributes.new(name=attr.name, type=attr.data_type, domain='POINT')
+            proxy_v_idx = 0
+            for poly in src_obj.data.polygons:
+                for li in poly.loop_indices:
+                    src_v_idx = src_obj.data.loops[li].vertex_index
+                    if attr.domain == 'POINT': proxy_attr.data[proxy_v_idx].color = attr.data[src_v_idx].color
+                    elif attr.domain == 'CORNER': proxy_attr.data[proxy_v_idx].color = attr.data[li].color
+                    proxy_v_idx += 1
+
+    bake_col_name = "GENOS_LIVE_BAKE_DATA"
+    if bake_col_name in bpy.data.collections: bake_col = bpy.data.collections[bake_col_name]
+    else:
+        bake_col = bpy.data.collections.new(bake_col_name)
+        scene.collection.children.link(bake_col)
+        
+    for ob in list(bake_col.objects): bake_col.objects.unlink(ob)
+
+    hidden_states = {}
+    for ob in scene.objects:
+        if ob.name != proxy_obj.name:
+            hidden_states[ob] = ob.hide_render
+            ob.hide_render = True
+
+    bake_col.objects.link(proxy_obj)
+    proxy_obj.hide_render = False
+    proxy_obj.data.materials.clear()
+    proxy_obj.data.materials.append(temp_mat)
+
+    cam_data = bpy.data.cameras.new('GENOS_TEMP_CAM')
+    cam_data.type = 'ORTHO'
+    cam_data.ortho_scale = 1.0 
+    cam_obj = bpy.data.objects.new('GENOS_TEMP_CAM', cam_data)
+    cam_obj.location = (0.5, 0.5, 1.0) 
+    bake_col.objects.link(cam_obj)
+    cam_obj.hide_render = False
+    
+    orig_camera = scene.camera
+    scene.camera = cam_obj
+
+    orig_res_x, orig_res_y, orig_res_pct = scene.render.resolution_x, scene.render.resolution_y, scene.render.resolution_percentage
+    orig_film_transp, orig_color_mode = scene.render.film_transparent, scene.render.image_settings.color_mode
+    orig_view_transform, orig_look = scene.view_settings.view_transform, scene.view_settings.look
+    orig_filepath = scene.render.filepath
+    
+    scene.render.resolution_x = size
+    scene.render.resolution_y = size
+    scene.render.resolution_percentage = 100 
+    
+    tmp_dir = tempfile.mkdtemp(prefix='genos_eevee_')
+    tmp_path = os.path.join(tmp_dir, 'bake_output.png')
+    scene.render.filepath = tmp_path
+    
+    scene.render.film_transparent = True
+    scene.render.image_settings.file_format = 'PNG'
+    scene.render.image_settings.color_mode = 'RGBA'
+    scene.view_settings.view_transform = 'Raw'
+    scene.view_settings.look = 'None'
+
+    orig_display = context.preferences.view.render_display_type
+    context.preferences.view.render_display_type = 'WINDOW'
+    context.view_layer.update() 
+    try: bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+    except: pass
+
+    success = True
+    try:
+        bpy.ops.render.render('EXEC_DEFAULT', write_still=True)
+        if os.path.exists(tmp_path):
+            rendered_img = bpy.data.images.load(tmp_path)
+            target_img.pixels = rendered_img.pixels
+            bpy.data.images.remove(rendered_img)
+            target_img.update()
+        else: success = False
+    except Exception as e:
+        print('CAMERA_RENDER_ERROR:', e)
+        success = False
+
+    context.preferences.view.render_display_type = orig_display
+    scene.camera = orig_camera
+    scene.render.resolution_x, scene.render.resolution_y, scene.render.resolution_percentage = orig_res_x, orig_res_y, orig_res_pct
+    scene.render.film_transparent, scene.render.image_settings.color_mode = orig_film_transp, orig_color_mode
+    scene.view_settings.view_transform, scene.view_settings.look = orig_view_transform, orig_look
+    scene.render.filepath = orig_filepath
+
+    for ob, state in hidden_states.items(): ob.hide_render = state
+
+    bpy.data.objects.remove(proxy_obj)
+    bpy.data.meshes.remove(proxy_mesh)
+    bpy.data.objects.remove(cam_obj)
+    bpy.data.cameras.remove(cam_data)
+
+    return success
+
 def _bake_generated_mask(context, obj, target_img, target_node_name, graph_builder, *, colorspace=MASK_COLORSPACE, prefill=(0.0, 0.0, 0.0, 1.0)):
     if target_img is None:
         return False
@@ -7804,15 +7907,10 @@ def _bake_generated_mask(context, obj, target_img, target_node_name, graph_build
 
     success = False
     try:
-        success = execute_bake(
-            context,
-            temp_mat,
-            target_node_name,
-            is_ao=False,
-            colorspace=colorspace,
-            prefill_color=prefill,
-            pack_after=True,
-        )
+        success = _bake_material_via_live_camera(context, obj, temp_mat, target_img)
+        if success:
+            try: target_img.pack()
+            except Exception: pass
     finally:
         for i, slot in enumerate(obj.material_slots):
             if i < len(orig_mats):
